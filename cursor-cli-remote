@@ -1,0 +1,617 @@
+#!/usr/bin/env bash
+# Super+Space launcher: pick / attach / stop Cursor `agent persist` sessions over SSH.
+set -euo pipefail
+
+CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/cursor-cli-remote.env"
+if [[ -f "$CONFIG" ]]; then
+  # shellcheck disable=SC1090
+  set -a
+  source "$CONFIG"
+  set +a
+fi
+
+REMOTE="${CURSOR_REMOTE:-forge}"
+REMOTE_DIR="${CURSOR_REMOTE_DIR:-$HOME/work}"
+AGENT="${CURSOR_REMOTE_AGENT:-$HOME/.local/bin/agent}"
+WINDOW_TITLE="${CURSOR_REMOTE_TITLE:-Cursor Forge}"
+MAX_AGE_SECS="${CURSOR_REMOTE_MAX_AGE_SECS:-$((7 * 24 * 3600))}"
+THEME_COLORS="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current/theme/colors.toml"
+SHORTCUTS="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+export GHOSTTY_RESOURCES_DIR="${GHOSTTY_RESOURCES_DIR:-1}"
+
+theme_color() {
+  local key="$1" fallback="$2"
+  [[ -f "$THEME_COLORS" ]] || { printf '%s\n' "$fallback"; return; }
+  awk -F'"' -v k="$key" '$1 ~ "^"k"[[:space:]]*=" { print $2; found=1; exit } END { if (!found) exit 1 }' "$THEME_COLORS" \
+    || printf '%s\n' "$fallback"
+}
+
+# Default identity: Catppuccin mauve. Override with CURSOR_REMOTE_ACCENT.
+ACCENT="${CURSOR_REMOTE_ACCENT:-#cba6f7}"
+FG="$(theme_color foreground '#bebebe')"
+MUTED="$(theme_color dark_foreground '#555555')"
+BG="$(theme_color background '#121212')"
+
+die() {
+  printf '\n'
+  gum style --foreground "$ACCENT" --padding "1 2" "$*"
+  gum style --faint --foreground "$MUTED" "Entrée pour fermer."
+  read -r _ || true
+  exit 1
+}
+
+ssh_forge() {
+  ssh -o ConnectTimeout=8 "$REMOTE" "$@"
+}
+
+flush_tty() {
+  python3 -c '
+import os, select
+try:
+    fd = os.open("/dev/tty", os.O_RDONLY)
+except OSError:
+    raise SystemExit(0)
+try:
+    while True:
+        r, _, _ = select.select([fd], [], [], 0)
+        if not r:
+            break
+        if not os.read(fd, 4096):
+            break
+finally:
+    os.close(fd)
+' 2>/dev/null || true
+}
+
+restore_tty() {
+  stty sane < /dev/tty 2>/dev/null || true
+  flush_tty
+}
+
+ssh_forge_tty() {
+  restore_tty
+  clear
+  ssh -tt -o RequestTTY=force -o ConnectTimeout=8 "$REMOTE" "$@" </dev/tty >/dev/tty 2>/dev/tty
+}
+
+FETCH_PY='
+import os, re, subprocess, sys, time
+
+agent = os.environ["AGENT"]
+prune = os.environ.get("PRUNE") == "1"
+max_age = int(os.environ.get("MAX_AGE_SECS", str(7 * 24 * 3600)))
+sock = "/tmp/tmux-%d/cursor-agent" % os.getuid()
+
+def tmux_created():
+    try:
+        out = subprocess.check_output(
+            ["tmux", "-S", sock, "list-sessions", "-F", "#{session_name}\t#{session_created}"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return {}
+    created = {}
+    for line in out.splitlines():
+        if "\t" not in line:
+            continue
+        name, ts = line.split("\t", 1)
+        try:
+            created[name.strip()] = int(ts.strip())
+        except ValueError:
+            pass
+    return created
+
+def persist_list():
+    r = subprocess.run([agent, "persist", "list"], text=True, capture_output=True)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr or r.stdout or "persist list failed\n")
+        sys.exit(r.returncode or 1)
+    return r.stdout
+
+def session_names(text):
+    return [m.strip() for m in re.findall(r"^  Session: (.+)$", text, re.M)]
+
+pruned = 0
+listing = persist_list()
+created = tmux_created()
+if prune:
+    cutoff = int(time.time()) - max_age
+    for name in session_names(listing):
+        ts = created.get(name, 0)
+        if ts > 0 and ts < cutoff:
+            r = subprocess.run([agent, "persist", "stop", name], capture_output=True, text=True)
+            if r.returncode == 0:
+                pruned += 1
+    listing = persist_list()
+    created = tmux_created()
+
+sys.stdout.write("---PRUNED---%d\n" % pruned)
+sys.stdout.write(listing)
+if listing and not listing.endswith("\n"):
+    sys.stdout.write("\n")
+sys.stdout.write("---CREATED---\n")
+for name, ts in created.items():
+    sys.stdout.write("%s\t%d\n" % (name, ts))
+'
+
+fetch_remote_cmd() {
+  local prune="$1"
+  local encoded
+  encoded="$(printf '%s' "$FETCH_PY" | base64 -w0)"
+  printf 'echo %s | base64 -d | AGENT=%s PRUNE=%s MAX_AGE_SECS=%s python3 -' \
+    "$(printf '%q' "$encoded")" \
+    "$(printf '%q' "$AGENT")" \
+    "$(printf '%q' "$prune")" \
+    "$(printf '%q' "$MAX_AGE_SECS")"
+}
+
+parse_sessions() {
+  python3 -c '
+import re, sys
+text = sys.stdin.read()
+list_part, _, created_part = text.partition("---CREATED---")
+created = {}
+for line in created_part.splitlines():
+    line = line.strip()
+    if not line or "\t" not in line:
+        continue
+    name, ts = line.split("\t", 1)
+    try:
+        created[name.strip()] = int(ts.strip())
+    except ValueError:
+        pass
+if "No Cursor-managed persistent sessions" in list_part:
+    raise SystemExit(0)
+rows = []
+blocks = re.split(r"\n(?=Task: )", list_part)
+for block in blocks:
+    m_name = re.search(r"^  Session: (.+)$", block, re.M)
+    if not m_name:
+        continue
+    name = m_name.group(1).strip()
+    task = "Sans titre"
+    m_task = re.search(r"^Task: (.+)$", block, re.M)
+    if m_task:
+        task = m_task.group(1).strip() or "Sans titre"
+    status = ""
+    m_status = re.search(r"^  Status: (.+)$", block, re.M)
+    if m_status:
+        status = m_status.group(1).strip()
+    ts = created.get(name, 0)
+    rows.append((ts, name, task, status))
+rows.sort(key=lambda r: r[0], reverse=True)
+for ts, name, task, status in rows:
+    print(f"{name}\t{task}\t{status}\t{ts}")
+'
+}
+
+fmt_row() {
+  python3 -c '
+from datetime import datetime
+import sys
+key, name, task, status, created = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]
+live = status.lower().startswith("attached")
+dot = "●" if live else "○"
+tag = "en ligne" if live else "en fond"
+if len(task) > 80:
+    task = task[:79] + "…"
+stamp = "[--/--/-- --:--]"
+try:
+    ts = int(created)
+    if ts > 0:
+        stamp = datetime.fromtimestamp(ts).strftime("[%y-%m-%d %H:%M]")
+except ValueError:
+    pass
+print(f"{key}  {stamp}  {dot}  {task}    {tag}\t{name}")
+' "$1" "$2" "$3" "$4" "$5"
+}
+
+header_sub() {
+  local count="${1:-}" extra="${2:-}"
+  local sub="${REMOTE}  ·  persist"
+  if [[ "$count" == loading ]]; then
+    sub+="  ·  connexion…"
+  elif [[ -n "$count" ]]; then
+    if ((count == 0)); then
+      sub+="  ·  aucune session"
+    else
+      local noun="session"
+      ((count > 1)) && noun="sessions"
+      sub+="  ·  ${count} ${noun}"
+    fi
+  fi
+  if [[ -n "$extra" ]]; then
+    sub+="  ·  ${extra}"
+  fi
+  printf '%s' "$sub"
+}
+
+MENU_PY='
+import fcntl, os, select, struct, sys, termios, time, tty, unicodedata
+
+SHORTCUTS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+PAD_X, PAD_Y = 2, 1
+MIN_INNER = 44
+
+def rgb(value, fallback):
+    value = (value or "").lstrip("#")
+    try:
+        return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
+    except Exception:
+        return fallback
+
+ACCENT = rgb(os.environ.get("ACCENT"), (203, 166, 247))
+FG = rgb(os.environ.get("FG"), (190, 190, 190))
+MUTED = rgb(os.environ.get("MUTED"), (85, 85, 85))
+BG = rgb(os.environ.get("BG"), (18, 18, 18))
+TITLE = os.environ.get("TITLE", "Cursor Forge")
+SUB = os.environ.get("SUB", "forge  ·  persist")
+HINT = os.environ.get("HINT", "0–9 A…  →/⏎  ouvrir     ↑↓     ⌫  supprimer     esc")
+MODE = os.environ.get("MODE", "pick")
+
+def dw(text):
+    n = 0
+    for ch in text:
+        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return n
+
+def fit(text, width):
+    if dw(text) <= width:
+        return text
+    out = []
+    n = 0
+    for ch in text:
+        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+        if n + w + 1 > width:
+            break
+        out.append(ch)
+        n += w
+    return "".join(out) + "…"
+
+def pad(text, width):
+    text = fit(text, width)
+    return text + " " * (width - dw(text))
+
+def cell(text, fg, bg):
+    return "\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm%s" % (
+        fg[0], fg[1], fg[2], bg[0], bg[1], bg[2], text
+    )
+
+rows_in = [ln.rstrip("\n") for ln in sys.stdin.read().splitlines() if ln] if MODE == "pick" else []
+labels, ids, keys = [], [], {}
+for row in rows_in:
+    if "\t" in row:
+        label, ident = row.split("\t", 1)
+    else:
+        label, ident = row, ""
+    labels.append(label)
+    ids.append(ident)
+    k = label[:1]
+    if k in SHORTCUTS:
+        keys[k] = ident
+        keys[k.lower()] = ident
+if MODE == "pick" and not labels:
+    sys.exit(1)
+
+fd = os.open("/dev/tty", os.O_RDWR)
+ui = os.fdopen(os.dup(fd), "w", buffering=1)
+old = termios.tcgetattr(fd)
+
+def restore():
+    try:
+        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        ui.write("\033[0m\033[?25h")
+        ui.flush()
+    except Exception:
+        pass
+
+def winsize():
+    try:
+        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
+        r, c = struct.unpack("HHHH", packed)[:2]
+        return max(int(r), 8), max(int(c), 24)
+    except Exception:
+        return 24, 80
+
+def drain():
+    termios.tcflush(fd, termios.TCIFLUSH)
+    while select.select([fd], [], [], 0)[0]:
+        if not os.read(fd, 4096):
+            break
+
+def quiet_drain(seconds=0.08):
+    end = time.monotonic() + seconds
+    while True:
+        timeout = end - time.monotonic()
+        if timeout <= 0:
+            break
+        if select.select([fd], [], [], timeout)[0]:
+            if not os.read(fd, 4096):
+                break
+            end = time.monotonic() + 0.02
+
+def read_key():
+    ch = os.read(fd, 1)
+    if not ch:
+        return "esc"
+    if ch in (b"\r", b"\n"):
+        return "enter"
+    if ch in (b"\x7f", b"\x08"):
+        return "bspace"
+    if ch == b"\x03":
+        return "esc"
+    if ch != b"\x1b":
+        try:
+            return ch.decode("utf-8")
+        except UnicodeDecodeError:
+            return "ignore"
+    seq = bytearray(ch)
+    if select.select([fd], [], [], 0.05)[0]:
+        nxt = os.read(fd, 1)
+        seq += nxt
+        if nxt in (b"[", b"O"):
+            while select.select([fd], [], [], 0.05)[0]:
+                nxt = os.read(fd, 1)
+                seq += nxt
+                if nxt.isalpha() or nxt in b"~":
+                    break
+    if seq in (b"\x1b", b"\x1b\x1b"):
+        return "esc"
+    if seq in (b"\x1b[A", b"\x1bOA"):
+        return "up"
+    if seq in (b"\x1b[B", b"\x1bOB"):
+        return "down"
+    if seq in (b"\x1b[C", b"\x1bOC"):
+        return "right"
+    if seq in (b"\x1b[D", b"\x1bOD"):
+        return "left"
+    return "ignore"
+
+idx = 0
+scroll = 0
+
+def paint_box():
+    global scroll
+    term_r, term_c = winsize()
+    show_list = MODE == "pick"
+    items = labels if show_list else []
+    chrome = 2 + 2 * PAD_Y + 2
+    if show_list:
+        chrome += 3
+    max_rows = max(1, term_r - chrome)
+    if show_list:
+        if idx < scroll:
+            scroll = idx
+        if idx >= scroll + max_rows:
+            scroll = idx - max_rows + 1
+        visible = items[scroll:scroll + max_rows]
+    else:
+        visible = []
+
+    inner = MIN_INNER
+    inner = max(inner, dw(TITLE), dw(SUB))
+    if show_list:
+        inner = max(inner, dw(HINT))
+        for lab in items:
+            inner = max(inner, dw("› " + lab))
+    inner = min(inner, max(20, term_c - 2 - 2 * PAD_X))
+    box_w = inner + 2 + 2 * PAD_X
+    inner_lines = 2 + 2 * PAD_Y
+    if show_list:
+        inner_lines += 3 + len(visible)
+    box_h = inner_lines + 2
+    top = max(1, (term_r - box_h) // 2 + 1)
+    left = max(1, (term_c - box_w) // 2 + 1)
+    bar = "─" * (box_w - 2)
+    blank = " " * inner
+
+    def put(row, text):
+        ui.write("\033[%d;%dH%s\033[0m" % (row, left, text))
+
+    def side(content, fg):
+        return (
+            cell("│", ACCENT, BG)
+            + cell(" " * PAD_X, FG, BG)
+            + cell(pad(content, inner), fg, BG)
+            + cell(" " * PAD_X, FG, BG)
+            + cell("│", ACCENT, BG)
+        )
+
+    ui.write("\033[0m\033[2J\033[H\033[?25l")
+    row = top
+    put(row, cell("╭" + bar + "╮", ACCENT, BG)); row += 1
+    for _ in range(PAD_Y):
+        put(row, side(blank, FG)); row += 1
+    put(row, side(TITLE, ACCENT)); row += 1
+    put(row, side(SUB, MUTED)); row += 1
+    if show_list:
+        put(row, side(blank, FG)); row += 1
+        put(row, side(HINT, MUTED)); row += 1
+        put(row, side(blank, FG)); row += 1
+        for i, lab in enumerate(visible):
+            real = scroll + i
+            if real == idx:
+                put(row, side("› " + lab, ACCENT))
+            else:
+                put(row, side("  " + lab, FG))
+            row += 1
+    for _ in range(PAD_Y):
+        put(row, side(blank, FG)); row += 1
+    put(row, cell("╰" + bar + "╯", ACCENT, BG))
+    ui.flush()
+
+try:
+    if MODE != "pick":
+        paint_box()
+        ui.write("\033[?25h")
+        ui.flush()
+        sys.exit(0)
+    drain()
+    tty.setraw(fd)
+    paint_box()
+    drain()
+    quiet_drain()
+    while True:
+        key = read_key()
+        if key == "esc":
+            restore()
+            sys.exit(130)
+        if key == "up":
+            idx = (idx - 1) % len(labels)
+            paint_box()
+            continue
+        if key == "down":
+            idx = (idx + 1) % len(labels)
+            paint_box()
+            continue
+        if key == "left" or key == "ignore":
+            continue
+        action = None
+        ident = None
+        if key in keys:
+            action, ident = "open", keys[key]
+        elif key in ("enter", "right"):
+            action, ident = "open", ids[idx]
+        elif key == "bspace":
+            action, ident = "delete", ids[idx]
+        else:
+            continue
+        restore()
+        sys.stdout.write("%s\n%s\n" % (action, ident))
+        sys.stdout.flush()
+        sys.exit(0)
+finally:
+    if MODE == "pick":
+        restore()
+'
+
+draw_header() {
+  restore_tty
+  MODE=loading TITLE="$WINDOW_TITLE" SUB="$(header_sub "$@")" \
+    ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
+    python3 -c "$MENU_PY" </dev/null >/dev/tty
+}
+
+choose() {
+  local sub="$1"
+  restore_tty
+  MODE=pick TITLE="$WINDOW_TITLE" SUB="$sub" \
+    HINT="0–9 A…  →/⏎  ouvrir     ↑↓     ⌫  supprimer     esc" \
+    ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
+    python3 -c "$MENU_PY"
+}
+
+new_session() {
+  ssh_forge_tty "cd $(printf '%q' "$REMOTE_DIR") && exec $AGENT persist --trust"
+}
+
+attach_session() {
+  local name="$1"
+  ssh_forge_tty "cd $(printf '%q' "$REMOTE_DIR") && exec $AGENT persist attach $(printf '%q' "$name")"
+}
+
+run_session() {
+  set +e
+  "$@"
+  local st=$?
+  set -e
+  restore_tty
+  if ((st != 0)); then
+    printf '\n'
+    gum style --foreground "$ACCENT" --padding "0 1" "Session interrompue (code ${st})."
+    gum style --foreground "$MUTED" "Entrée pour revenir au menu."
+    read -r _ </dev/tty || true
+  fi
+}
+
+stop_session() {
+  local name="$1"
+  ssh_forge "$AGENT persist stop $(printf '%q' "$name")"
+}
+
+printf '\e]0;%s\a' "$WINDOW_TITLE" || true
+declare -A TASK_BY_ID=()
+need_prune=1
+prune_note=""
+
+while true; do
+  clear
+  if ((need_prune)); then
+    draw_header loading "purge >7j"
+  else
+    draw_header loading
+  fi
+
+  raw=""
+  set +e
+  raw="$(ssh -o ConnectTimeout=8 "$REMOTE" "$(fetch_remote_cmd "$need_prune")")"
+  ssh_status=$?
+  set -e
+  ((ssh_status == 0)) || die "Impossible de joindre forge (YubiKey, réseau, ou SSH)."
+
+  pruned=0
+  if [[ "$raw" =~ ---PRUNED---([0-9]+) ]]; then
+    pruned="${BASH_REMATCH[1]}"
+  fi
+  if ((need_prune)); then
+    need_prune=0
+    if ((pruned == 1)); then
+      prune_note="1 session >7j arrêtée"
+    elif ((pruned > 1)); then
+      prune_note="${pruned} sessions >7j arrêtées"
+    fi
+  fi
+
+  mapfile -t rows < <(printf '%s\n' "$raw" | parse_sessions)
+  count="${#rows[@]}"
+
+  options=()
+  TASK_BY_ID=()
+  options+=("+  Nouvelle session"$'\t'"[new]")
+  i=0
+  for row in "${rows[@]+"${rows[@]}"}"; do
+    IFS=$'\t' read -r name task status created <<<"$row"
+    TASK_BY_ID["$name"]="$task"
+    key=" "
+    if ((i < ${#SHORTCUTS})); then
+      key="${SHORTCUTS:i:1}"
+    fi
+    options+=("$(fmt_row "$key" "$name" "$task" "$status" "${created:-0}")")
+    i=$((i + 1))
+  done
+
+  out=""
+  action=""
+  sel=""
+  id=""
+  set +e
+  out="$(printf '%s\n' "${options[@]}" | choose "$(header_sub "$count" "$prune_note")")"
+  choose_status=$?
+  set -e
+  if ((choose_status == 130 || choose_status == 1)); then
+    exit 0
+  fi
+  ((choose_status == 0)) || die "Sélection impossible ($choose_status)."
+
+  action="$(printf '%s\n' "$out" | sed -n '1p' | tr -d '\r')"
+  sel="$(printf '%s\n' "$out" | sed -n '2p' | tr -d '\r')"
+  id="${sel##*$'\t'}"
+
+  restore_tty
+  if [[ "$action" == delete ]]; then
+    if [[ -n "$id" && "$id" != '[new]' ]]; then
+      stop_session "$id" || true
+    fi
+    continue
+  fi
+
+  if [[ "$id" == '[new]' ]]; then
+    run_session new_session
+    continue
+  fi
+
+  [[ -n "$id" ]] || continue
+  run_session attach_session "$id"
+done
