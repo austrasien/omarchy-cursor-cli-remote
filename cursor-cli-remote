@@ -640,6 +640,113 @@ ssh_master_ok() {
   ssh -O check "$REMOTE" >/dev/null 2>&1
 }
 
+# ControlMaster forks inside Foot's gtk-launch/uwsm scope. When the window
+# closes, systemd kills the mux and the next launch asks for the YubiKey
+# again. Move it onto a delegated user service (Delegate=yes is required
+# for AttachProcessesToUnit). The 04:00 ssh-forge-close.timer still drops it.
+MUX_UNIT="ssh-${REMOTE}-mux.service"
+
+drop_stale_master() {
+  ssh_master_ok && return 0
+  [[ -n "${FORGE_CONTROL:-}" && -S "$FORGE_CONTROL" ]] && rm -f "$FORGE_CONTROL"
+}
+
+mux_pid_for_socket() {
+  python3 -c '
+import os, sys
+sock = os.path.realpath(sys.argv[1])
+
+def pids():
+    for name in os.listdir("/proc"):
+        if name.isdigit():
+            yield name
+
+for pid in pids():
+    fd_dir = "/proc/%s/fd" % pid
+    try:
+        fds = os.listdir(fd_dir)
+    except OSError:
+        continue
+    for fd in fds:
+        try:
+            link = os.readlink(os.path.join(fd_dir, fd))
+        except OSError:
+            continue
+        if link == sock:
+            print(pid)
+            raise SystemExit(0)
+        if link.startswith("/") and os.path.realpath(link) == sock:
+            print(pid)
+            raise SystemExit(0)
+
+inode = None
+try:
+    with open("/proc/net/unix") as fh:
+        next(fh, None)
+        for line in fh:
+            parts = line.split()
+            if len(parts) >= 8 and os.path.realpath(parts[-1]) == sock:
+                inode = parts[6]
+                break
+except OSError:
+    pass
+if inode:
+    needle = "socket:[%s]" % inode
+    for pid in pids():
+        fd_dir = "/proc/%s/fd" % pid
+        try:
+            fds = os.listdir(fd_dir)
+        except OSError:
+            continue
+        for fd in fds:
+            try:
+                if os.readlink(os.path.join(fd_dir, fd)) == needle:
+                    print(pid)
+                    raise SystemExit(0)
+            except OSError:
+                continue
+
+needle = sock.encode()
+for pid in pids():
+    try:
+        with open("/proc/%s/cmdline" % pid, "rb") as fh:
+            cmd = fh.read().replace(b"\0", b" ")
+    except OSError:
+        continue
+    if needle in cmd and b"mux" in cmd:
+        print(pid)
+        raise SystemExit(0)
+raise SystemExit(1)
+' "$1" 2>/dev/null
+}
+
+ensure_mux_unit() {
+  local unit="$1"
+  systemctl --user is-active --quiet "$unit" && return 0
+  systemctl --user reset-failed "$unit" 2>/dev/null || true
+  systemd-run --user --quiet --collect \
+    --unit="$unit" \
+    --property=Delegate=yes \
+    --property=Slice=app.slice \
+    /usr/bin/sleep infinity >/dev/null 2>&1
+}
+
+rehome_mux() {
+  local sock pid unit="$MUX_UNIT"
+  sock="${FORGE_CONTROL:-}"
+  [[ -n "$sock" && -S "$sock" ]] || return 0
+  command -v busctl >/dev/null 2>&1 || return 0
+  pid="$(mux_pid_for_socket "$sock")" || return 0
+  [[ -n "$pid" ]] || return 0
+  if grep -q "/${unit}$" "/proc/${pid}/cgroup" 2>/dev/null; then
+    return 0
+  fi
+  ensure_mux_unit "$unit" || return 0
+  busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+    org.freedesktop.systemd1.Manager AttachProcessesToUnit \
+    ssau "$unit" / 1 "$pid" >/dev/null 2>&1 || true
+}
+
 draw_wait() {
   local sub="$1"
   restore_tty
@@ -669,6 +776,7 @@ open_master() {
   restore_tty
   unset SSH_ASKPASS
   [[ -n "$FORGE_HOST" ]] || load_ssh_meta
+  drop_stale_master
   mkdir -p "$(dirname "${FORGE_CONTROL:-$HOME/.ssh/sockets/x}")"
   for ident in "${FORGE_IDENTS[@]}"; do
     [[ -r "$ident" ]] || continue
@@ -703,7 +811,11 @@ open_master() {
 
 ensure_forge() {
   local wait_st=0 st=0 why
-  ssh_master_ok && return 0
+  drop_stale_master
+  if ssh_master_ok; then
+    rehome_mux
+    return 0
+  fi
   while true; do
     if ! yubikey_present; then
       set +e
@@ -720,6 +832,7 @@ ensure_forge() {
     st=$?
     set -e
     if ((st == 0)) || ssh_master_ok; then
+      rehome_mux
       return 0
     fi
     why="PIN, touche, ou réseau"

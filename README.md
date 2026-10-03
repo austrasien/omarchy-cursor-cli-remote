@@ -49,6 +49,8 @@ Foot class: `org.omarchy.agent.forge` so [agent-title](https://github.com/austra
 
 If the SSH key is FIDO (`ed25519-sk`) and the YubiKey is unplugged, the mauve box stays open: plug USB-C, PIN if asked, touch the gold pad. The launcher retries as soon as vendor `1050` appears; Esc closes. Each `IdentityFile` is tried on its own so the unplugged key does not dump `device not found` over the TUI. PIN / touch prompts stay below the mauve box.
 
+The SSH ControlMaster is moved out of Foot’s systemd scope into `ssh-<host>-mux.service` (`Delegate=yes`) so closing the window does not kill the mux. The next launch reuses the tunnel until the 04:00 `ssh-forge-close.timer` (or `ssh-forge-expire.sh` after suspend).
+
 ```sh
 git clone https://github.com/austrasien/omarchy-cursor-cli-remote.git
 cd omarchy-cursor-cli-remote
