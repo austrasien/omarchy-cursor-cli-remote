@@ -9,6 +9,11 @@ die() {
   local accent="${ACCENT:-#cba6f7}"
   local muted="${MUTED:-#555555}"
   set +e
+  if declare -F restore_tty >/dev/null; then
+    restore_tty
+  else
+    stty sane < /dev/tty 2>/dev/null || true
+  fi
   {
     printf '\n'
     if command -v gum >/dev/null; then
@@ -53,9 +58,42 @@ theme_color() {
 
 # Default identity: Catppuccin mauve. Override with CURSOR_REMOTE_ACCENT.
 ACCENT="${CURSOR_REMOTE_ACCENT:-#cba6f7}"
+[[ -n "$ACCENT" ]] || ACCENT="#cba6f7"
 FG="$(theme_color foreground '#bebebe')"
 MUTED="$(theme_color dark_foreground '#555555')"
 BG="$(theme_color background '#121212')"
+
+FORGE_HOST=""
+FORGE_USER=""
+FORGE_CONTROL=""
+FORGE_IDENTS=()
+
+load_ssh_meta() {
+  local k v ident
+  FORGE_HOST=""
+  FORGE_USER=""
+  FORGE_CONTROL=""
+  FORGE_IDENTS=()
+  while read -r k v; do
+    case "${k,,}" in
+      hostname) FORGE_HOST="$v" ;;
+      user) FORGE_USER="$v" ;;
+      controlpath) FORGE_CONTROL="$v" ;;
+      identityfile)
+        ident="${v/#\~/$HOME}"
+        FORGE_IDENTS+=("$ident")
+        ;;
+    esac
+  done < <(ssh -G "$REMOTE" 2>/dev/null)
+  ((${#FORGE_IDENTS[@]})) || FORGE_IDENTS=(
+    "$HOME/.ssh/id_ed25519_sk_yk1"
+    "$HOME/.ssh/id_ed25519_sk_yk2"
+  )
+  [[ -n "$FORGE_HOST" ]] || FORGE_HOST="$REMOTE"
+  [[ -n "$FORGE_USER" ]] || FORGE_USER="${USER:-austraz}"
+}
+
+load_ssh_meta
 
 ssh_forge() {
   SSH_ASKPASS_REQUIRE=never ssh -o ConnectTimeout=8 "$REMOTE" "$@"
@@ -623,12 +661,44 @@ draw_pin() {
     python3 -c "$MENU_PY" </dev/null >/dev/tty
 }
 
+# One IdentityFile per attempt. Putting both in ssh_config makes OpenSSH
+# print "device not found" for the unplugged key. Do not pipe ssh stderr:
+# a process substitution + set -e aborts the launcher right after PIN.
 open_master() {
+  local ident st=1 i
   restore_tty
   unset SSH_ASKPASS
-  SSH_ASKPASS_REQUIRE=never ssh -o ConnectTimeout=8 -o BatchMode=no \
-    -o PreferredAuthentications=publickey \
-    "$REMOTE" true </dev/tty >/dev/tty 2>/dev/tty
+  [[ -n "$FORGE_HOST" ]] || load_ssh_meta
+  mkdir -p "$(dirname "${FORGE_CONTROL:-$HOME/.ssh/sockets/x}")"
+  for ident in "${FORGE_IDENTS[@]}"; do
+    [[ -r "$ident" ]] || continue
+    set +e
+    SSH_ASKPASS_REQUIRE=never ssh -F /dev/null \
+      -o ConnectTimeout=8 \
+      -o BatchMode=no \
+      -o PreferredAuthentications=publickey \
+      -o NumberOfPasswordPrompts=0 \
+      -o IdentitiesOnly=yes \
+      -o IdentityAgent=none \
+      -o IdentityFile="$ident" \
+      -o HostName="$FORGE_HOST" \
+      -o User="$FORGE_USER" \
+      -o ControlMaster=auto \
+      -o ControlPath="${FORGE_CONTROL:-$HOME/.ssh/sockets/%C}" \
+      -o ControlPersist=yes \
+      "$FORGE_HOST" true </dev/tty >/dev/tty 2>/dev/tty
+    st=$?
+    set +e
+    if ((st == 0)); then
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        ssh_master_ok && return 0
+        sleep 0.1
+      done
+      return 0
+    fi
+    ssh_master_ok && return 0
+  done
+  return "$st"
 }
 
 ensure_forge() {
@@ -642,7 +712,7 @@ ensure_forge() {
       set -e
       ((wait_st == 130)) && exit 0
       yubikey_present || continue
-      sleep 0.5
+      sleep 1
     fi
     draw_pin
     set +e
@@ -654,6 +724,8 @@ ensure_forge() {
     fi
     why="PIN, touche, ou réseau"
     yubikey_present || why="YubiKey absente"
+    restore_tty
+    clear
     set +e
     draw_wait "${REMOTE}  ·  ${why} — réessaie"
     wait_st=$?
@@ -706,9 +778,9 @@ while true; do
 
   raw=""
   set +e
-  raw="$(SSH_ASKPASS_REQUIRE=never ssh -o ConnectTimeout=8 "$REMOTE" "$(fetch_remote_cmd "$need_prune")")"
+  raw="$(SSH_ASKPASS_REQUIRE=never ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE" "$(fetch_remote_cmd "$need_prune")")"
   ssh_status=$?
-  set -e
+  set +e
   if ((ssh_status != 0)); then
     if ssh_master_ok; then
       die "agent persist injoignable sur forge (${AGENT})."

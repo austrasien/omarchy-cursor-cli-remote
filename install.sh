@@ -56,7 +56,7 @@ CURSOR_REMOTE=forge
 CURSOR_REMOTE_DIR=$HOME/work
 CURSOR_REMOTE_AGENT=$HOME/.local/bin/agent
 CURSOR_REMOTE_TITLE="Cursor Forge"
-CURSOR_REMOTE_ACCENT=#cba6f7
+CURSOR_REMOTE_ACCENT="#cba6f7"
 CURSOR_REMOTE_MAX_AGE_SECS=$((7 * 24 * 3600))
 EOF
   printf 'Wrote %s\n' "$CONFIG"
@@ -74,12 +74,12 @@ cat >"$APPS/Cursor Forge CLI.desktop" <<EOF
 Version=1.0
 Name=Cursor Forge CLI
 Comment=Sessions Cursor persistantes via SSH
-Exec=foot ${FOOT_ARGS}--app-id=${APP_ID} -o key-bindings.show-urls-launch=Mod1+u -e ${BIN_OMARCHY}/cursor-cli-remote
+Exec=uwsm-app -- foot ${FOOT_ARGS}--app-id=${APP_ID} -o key-bindings.show-urls-launch=Mod1+u -e ${BIN_OMARCHY}/cursor-cli-remote
 Terminal=false
 Type=Application
 Icon=cursor-forge
 StartupWMClass=${APP_ID}
-StartupNotify=true
+StartupNotify=false
 Categories=Development;
 Keywords=cursor;cli;agent;forge;persist;ssh;remote;
 EOF

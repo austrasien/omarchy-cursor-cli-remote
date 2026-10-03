@@ -47,7 +47,7 @@ Foot class: `org.omarchy.agent.forge` so [agent-title](https://github.com/austra
 
 **Requirements:** `ssh`, `python3`, [gum](https://github.com/charmbracelet/gum), Foot, Cursor CLI `agent` on the **remote**, SSH host alias (ControlMaster recommended). Persist attach needs a TTY (`ssh -tt`).
 
-If the SSH key is FIDO (`ed25519-sk`) and the YubiKey is unplugged, the mauve box stays open: plug USB-C, PIN if asked, touch the gold pad. The launcher retries as soon as vendor `1050` appears; Esc closes.
+If the SSH key is FIDO (`ed25519-sk`) and the YubiKey is unplugged, the mauve box stays open: plug USB-C, PIN if asked, touch the gold pad. The launcher retries as soon as vendor `1050` appears; Esc closes. Each `IdentityFile` is tried on its own so the unplugged key does not dump `device not found` over the TUI. PIN / touch prompts stay below the mauve box.
 
 ```sh
 git clone https://github.com/austrasien/omarchy-cursor-cli-remote.git
@@ -55,7 +55,7 @@ cd omarchy-cursor-cli-remote
 ./install.sh
 ```
 
-Then Super+Space → **Cursor Forge CLI**. Optional Hyprland bind: `SHIFT + XF86AudioMedia` (Framework logo) to `gtk-launch "Cursor Forge CLI.desktop"`.
+Then Super+Space → **Cursor Forge CLI**. The `.desktop` starts Foot via `uwsm-app` with `StartupNotify=false`, so the systemd gtk-launch scope cannot kill the window after PIN. Optional Hyprland bind: `SHIFT + XF86AudioMedia` (Framework logo) to `gtk-launch "Cursor Forge CLI.desktop"`.
 
 ### Config
 
