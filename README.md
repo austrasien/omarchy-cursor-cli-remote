@@ -47,6 +47,8 @@ Foot class: `org.omarchy.agent.forge` so [agent-title](https://github.com/austra
 
 **Requirements:** `ssh`, `python3`, [gum](https://github.com/charmbracelet/gum), Foot, Cursor CLI `agent` on the **remote**, SSH host alias (ControlMaster recommended). Persist attach needs a TTY (`ssh -tt`).
 
+If the SSH key is FIDO (`ed25519-sk`) and the YubiKey is unplugged, the mauve box stays open: plug USB-C, PIN if asked, touch the gold pad. The launcher retries as soon as vendor `1050` appears; Esc closes.
+
 ```sh
 git clone https://github.com/austrasien/omarchy-cursor-cli-remote.git
 cd omarchy-cursor-cli-remote

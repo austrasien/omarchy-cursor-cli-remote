@@ -3,11 +3,35 @@
 set -euo pipefail
 
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/cursor-cli-remote.env"
+
+die() {
+  local msg="$*"
+  local accent="${ACCENT:-#cba6f7}"
+  local muted="${MUTED:-#555555}"
+  set +e
+  {
+    printf '\n'
+    if command -v gum >/dev/null; then
+      gum style --foreground "$accent" --padding "1 2" "$msg"
+      gum style --faint --foreground "$muted" "Entrée pour fermer."
+    else
+      printf '%s\nEntrée pour fermer.\n' "$msg"
+    fi
+  } >/dev/tty 2>/dev/null || printf '%s\n' "$msg"
+  read -r _ </dev/tty || true
+  exit 1
+}
+
 if [[ -f "$CONFIG" ]]; then
-  # shellcheck disable=SC1090
+  set +e
   set -a
+  # shellcheck disable=SC1090
+  # Values with spaces in the env file must be quoted (TITLE="Cursor Forge").
   source "$CONFIG"
+  src_status=$?
   set +a
+  set -e
+  ((src_status == 0)) || die "Config invalide: $CONFIG"
 fi
 
 REMOTE="${CURSOR_REMOTE:-forge}"
@@ -33,16 +57,8 @@ FG="$(theme_color foreground '#bebebe')"
 MUTED="$(theme_color dark_foreground '#555555')"
 BG="$(theme_color background '#121212')"
 
-die() {
-  printf '\n'
-  gum style --foreground "$ACCENT" --padding "1 2" "$*"
-  gum style --faint --foreground "$MUTED" "Entrée pour fermer."
-  read -r _ || true
-  exit 1
-}
-
 ssh_forge() {
-  ssh -o ConnectTimeout=8 "$REMOTE" "$@"
+  SSH_ASKPASS_REQUIRE=never ssh -o ConnectTimeout=8 "$REMOTE" "$@"
 }
 
 flush_tty() {
@@ -72,7 +88,9 @@ restore_tty() {
 ssh_forge_tty() {
   restore_tty
   clear
-  ssh -tt -o RequestTTY=force -o ConnectTimeout=8 "$REMOTE" "$@" </dev/tty >/dev/tty 2>/dev/tty
+  unset SSH_ASKPASS
+  SSH_ASKPASS_REQUIRE=never ssh -tt -o RequestTTY=force -o ConnectTimeout=8 \
+    "$REMOTE" "$@" </dev/tty >/dev/tty 2>/dev/tty
 }
 
 FETCH_PY='
@@ -229,11 +247,11 @@ header_sub() {
 }
 
 MENU_PY='
-import fcntl, os, select, struct, sys, termios, time, tty, unicodedata
+import fcntl, glob, os, select, struct, sys, termios, time, tty, unicodedata
 
 SHORTCUTS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 PAD_X, PAD_Y = 2, 1
-MIN_INNER = 44
+MIN_INNER = 52
 
 def rgb(value, fallback):
     value = (value or "").lstrip("#")
@@ -250,6 +268,17 @@ TITLE = os.environ.get("TITLE", "Cursor Forge")
 SUB = os.environ.get("SUB", "forge  ·  persist")
 HINT = os.environ.get("HINT", "0–9 A…  →/⏎  ouvrir     ↑↓     ⌫  supprimer     esc")
 MODE = os.environ.get("MODE", "pick")
+BODY_LINES = [ln for ln in os.environ.get("BODY", "").split("\n") if ln]
+
+def yubikey_plugged():
+    for path in glob.glob("/sys/bus/usb/devices/*/idVendor"):
+        try:
+            with open(path, encoding="ascii") as fh:
+                if fh.read().strip().lower() == "1050":
+                    return True
+        except OSError:
+            continue
+    return False
 
 def dw(text):
     n = 0
@@ -376,10 +405,15 @@ def paint_box():
     global scroll
     term_r, term_c = winsize()
     show_list = MODE == "pick"
+    show_body = MODE in ("wait", "pin")
+    show_hint = MODE in ("pick", "wait")
     items = labels if show_list else []
+    extra = BODY_LINES if show_body else []
     chrome = 2 + 2 * PAD_Y + 2
-    if show_list:
+    if show_list or MODE == "wait":
         chrome += 3
+    elif MODE == "pin":
+        chrome += 1 + len(extra)
     max_rows = max(1, term_r - chrome)
     if show_list:
         if idx < scroll:
@@ -388,21 +422,31 @@ def paint_box():
             scroll = idx - max_rows + 1
         visible = items[scroll:scroll + max_rows]
     else:
-        visible = []
+        visible = extra
 
     inner = MIN_INNER
     inner = max(inner, dw(TITLE), dw(SUB))
-    if show_list:
-        inner = max(inner, dw(HINT))
+    if show_list or show_body:
+        if show_hint:
+            inner = max(inner, dw(HINT))
         for lab in items:
             inner = max(inner, dw("› " + lab))
+        for lab in extra:
+            inner = max(inner, dw(lab))
     inner = min(inner, max(20, term_c - 2 - 2 * PAD_X))
     box_w = inner + 2 + 2 * PAD_X
     inner_lines = 2 + 2 * PAD_Y
     if show_list:
         inner_lines += 3 + len(visible)
+    elif MODE == "wait":
+        inner_lines += 3 + len(visible)
+    elif MODE == "pin":
+        inner_lines += 1 + len(extra)
     box_h = inner_lines + 2
     top = max(1, (term_r - box_h) // 2 + 1)
+    if MODE == "pin":
+        top = max(2, min(top, max(2, term_r // 6)))
+        top = min(top, max(2, term_r - box_h - 8))
     left = max(1, (term_c - box_w) // 2 + 1)
     bar = "─" * (box_w - 2)
     blank = " " * inner
@@ -437,15 +481,53 @@ def paint_box():
             else:
                 put(row, side("  " + lab, FG))
             row += 1
+    elif MODE == "wait":
+        put(row, side(blank, FG)); row += 1
+        put(row, side(HINT, MUTED)); row += 1
+        put(row, side(blank, FG)); row += 1
+        for lab in extra:
+            put(row, side(lab, FG)); row += 1
+    elif MODE == "pin":
+        put(row, side(blank, FG)); row += 1
+        for lab in extra:
+            put(row, side(lab, FG)); row += 1
     for _ in range(PAD_Y):
         put(row, side(blank, FG)); row += 1
     put(row, cell("╰" + bar + "╯", ACCENT, BG))
     ui.flush()
+    return row, term_r
 
 try:
+    if MODE == "wait":
+        drain()
+        tty.setraw(fd)
+        try:
+            while True:
+                if yubikey_plugged():
+                    restore()
+                    sys.exit(0)
+                paint_box()
+                r, _, _ = select.select([fd], [], [], 0.35)
+                if not r:
+                    continue
+                key = read_key()
+                if key == "esc":
+                    restore()
+                    sys.exit(130)
+                if key in ("enter", "right"):
+                    restore()
+                    sys.exit(0)
+        finally:
+            restore()
+    if MODE == "pin":
+        bottom, term_r = paint_box()
+        prompt_row = min(term_r, bottom + 2)
+        ui.write("\033[0m\033[%d;1H\033[J\033[?25h" % prompt_row)
+        ui.flush()
+        sys.exit(0)
     if MODE != "pick":
         paint_box()
-        ui.write("\033[?25h")
+        ui.write("\033[0m\033[?25h")
         ui.flush()
         sys.exit(0)
     drain()
@@ -503,6 +585,83 @@ choose() {
     python3 -c "$MENU_PY"
 }
 
+YUBI_BODY=$'1. Branche la YubiKey 5C en USB-C (YK1 quotidien ou YK2).
+2. PIN FIDO2 si demandé — le même PIN sur les deux clés.
+3. Touche le pad or. SSH ouvre alors le tunnel vers forge.'
+
+yubikey_present() {
+  local f
+  for f in /sys/bus/usb/devices/*/idVendor; do
+    [[ -f "$f" ]] || continue
+    [[ "$(<"$f")" == "1050" ]] && return 0
+  done
+  return 1
+}
+
+ssh_master_ok() {
+  ssh -O check "$REMOTE" >/dev/null 2>&1
+}
+
+draw_wait() {
+  local sub="$1"
+  restore_tty
+  MODE=wait TITLE="$WINDOW_TITLE" SUB="$sub" \
+    HINT="Entrée  réessayer     esc  fermer     reprise auto dès la clé" \
+    BODY="$YUBI_BODY" \
+    ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
+    python3 -c "$MENU_PY" </dev/null >/dev/tty
+}
+
+PIN_BODY=$'1. Tape le PIN FIDO2, puis Entrée.
+2. Touche le pad or.'
+
+draw_pin() {
+  restore_tty
+  MODE=pin TITLE="$WINDOW_TITLE" SUB="${REMOTE}  ·  PIN FIDO2" \
+    BODY="$PIN_BODY" \
+    ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
+    python3 -c "$MENU_PY" </dev/null >/dev/tty
+}
+
+open_master() {
+  restore_tty
+  unset SSH_ASKPASS
+  SSH_ASKPASS_REQUIRE=never ssh -o ConnectTimeout=8 -o BatchMode=no \
+    -o PreferredAuthentications=publickey \
+    "$REMOTE" true </dev/tty >/dev/tty 2>/dev/tty
+}
+
+ensure_forge() {
+  local wait_st=0 st=0 why
+  ssh_master_ok && return 0
+  while true; do
+    if ! yubikey_present; then
+      set +e
+      draw_wait "${REMOTE}  ·  YubiKey absente"
+      wait_st=$?
+      set -e
+      ((wait_st == 130)) && exit 0
+      yubikey_present || continue
+      sleep 0.5
+    fi
+    draw_pin
+    set +e
+    open_master
+    st=$?
+    set -e
+    if ((st == 0)) || ssh_master_ok; then
+      return 0
+    fi
+    why="PIN, touche, ou réseau"
+    yubikey_present || why="YubiKey absente"
+    set +e
+    draw_wait "${REMOTE}  ·  ${why} — réessaie"
+    wait_st=$?
+    set -e
+    ((wait_st == 130)) && exit 0
+  done
+}
+
 new_session() {
   ssh_forge_tty "cd $(printf '%q' "$REMOTE_DIR") && exec $AGENT persist --trust"
 }
@@ -538,6 +697,7 @@ prune_note=""
 
 while true; do
   clear
+  ensure_forge
   if ((need_prune)); then
     draw_header loading "purge >7j"
   else
@@ -546,10 +706,15 @@ while true; do
 
   raw=""
   set +e
-  raw="$(ssh -o ConnectTimeout=8 "$REMOTE" "$(fetch_remote_cmd "$need_prune")")"
+  raw="$(SSH_ASKPASS_REQUIRE=never ssh -o ConnectTimeout=8 "$REMOTE" "$(fetch_remote_cmd "$need_prune")")"
   ssh_status=$?
   set -e
-  ((ssh_status == 0)) || die "Impossible de joindre forge (YubiKey, réseau, ou SSH)."
+  if ((ssh_status != 0)); then
+    if ssh_master_ok; then
+      die "agent persist injoignable sur forge (${AGENT})."
+    fi
+    continue
+  fi
 
   pruned=0
   if [[ "$raw" =~ ---PRUNED---([0-9]+) ]]; then
