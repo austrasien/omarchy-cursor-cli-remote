@@ -125,7 +125,7 @@ restore_tty() {
 
 ssh_forge_tty() {
   restore_tty
-  clear
+  clear || true
   unset SSH_ASKPASS
   SSH_ASKPASS_REQUIRE=never ssh -tt -o RequestTTY=force -o ConnectTimeout=8 \
     "$REMOTE" "$@" </dev/tty >/dev/tty 2>/dev/tty
@@ -648,7 +648,10 @@ MUX_UNIT="ssh-${REMOTE}-mux.service"
 
 drop_stale_master() {
   ssh_master_ok && return 0
-  [[ -n "${FORGE_CONTROL:-}" && -S "$FORGE_CONTROL" ]] && rm -f "$FORGE_CONTROL"
+  if [[ -n "${FORGE_CONTROL:-}" && -S "$FORGE_CONTROL" ]]; then
+    rm -f "$FORGE_CONTROL"
+  fi
+  return 0
 }
 
 mux_pid_for_socket() {
@@ -838,7 +841,7 @@ ensure_forge() {
     why="PIN, touche, ou réseau"
     yubikey_present || why="YubiKey absente"
     restore_tty
-    clear
+    clear || true
     set +e
     draw_wait "${REMOTE}  ·  ${why} — réessaie"
     wait_st=$?
@@ -881,7 +884,7 @@ need_prune=1
 prune_note=""
 
 while true; do
-  clear
+  clear || true
   ensure_forge
   if ((need_prune)); then
     draw_header loading "purge >7j"
