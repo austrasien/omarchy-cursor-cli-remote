@@ -1,0 +1,701 @@
+#!/usr/bin/env python3
+"""Report a Cursor persist session (SSH) to Omarchy Spaces.
+
+Runs on the laptop. Cursor hooks on the remote write stamps; this process
+maps them onto the local Foot window PIDs and calls omarchy-shell.
+TUI capture (Ctrl+C to stop / Waiting for confirmation) is the fallback
+when stamps are missing. Exits on SIGTERM, dead launcher, or lost ssh
+attach so an adopted watcher does not outlive the Foot session.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PLUGIN = "tornikegomareli.spaces"
+HOOK_EVENTS = (
+    "beforeSubmitPrompt",
+    "preToolUse",
+    "beforeShellExecution",
+    "beforeMCPExecution",
+    "subagentStop",
+    "stop",
+    "sessionEnd",
+)
+STAMP_NAME = "spaces-forge-stamp.py"
+APP_ID = "org.omarchy.agent.forge"
+STAMP_WORKING_GRACE = 20.0
+IDLE_POLLS = 8
+POLL_PY = r"""
+import json, os, re, subprocess, sys, time
+from pathlib import Path
+
+session = os.environ.get("SESSION") or ""
+sock = "/tmp/tmux-%d/cursor-agent" % os.getuid()
+agent = os.environ.get("AGENT") or str(Path.home() / ".local/bin/agent")
+stamp_dir = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp") / "spaces-forge"
+now = time.time()
+
+def tmux(*args):
+    try:
+        return subprocess.check_output(
+            ["tmux", "-S", sock, *args], text=True, stderr=subprocess.DEVNULL
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+def strip_ansi(text):
+    return re.sub("\033" + r"\[[0-9;:]*[A-Za-z]", "", text or "")
+
+def parse_stamp(text):
+    parts = (text or "").split()
+    state = parts[0] if parts else ""
+    try:
+        ts = int(parts[1]) if len(parts) > 1 else 0
+    except ValueError:
+        ts = 0
+    age = (now - ts) if ts else 99999.0
+    return state, age
+
+title = ""
+if session:
+    title = tmux("display-message", "-p", "-t", session + ":", "#{pane_title}").strip()
+if not session or not title:
+    best = (-1, session, title)
+    for line in tmux("list-clients", "-F", "#{client_created}\t#{session_name}\t#{pane_title}").splitlines():
+        parts = line.split("\t", 2)
+        if len(parts) < 2:
+            continue
+        try:
+            created = int(parts[0])
+        except ValueError:
+            continue
+        if created >= best[0]:
+            best = (created, parts[1].strip(), parts[2].strip() if len(parts) > 2 else "")
+    if best[1]:
+        session, title = best[1], best[2]
+
+plain = strip_ansi(tmux("capture-pane", "-pe", "-t", session + ":") if session else "")
+waiting = bool(re.search(r"Waiting for (?:confirmation|you)\b", "%s\n%s" % (plain, title), re.I))
+running = bool(re.search(r"Ctrl\+C to stop", plain, re.I))
+
+chat = ""
+try:
+    listing = subprocess.check_output([agent, "persist", "list"], text=True, stderr=subprocess.DEVNULL)
+except Exception:
+    listing = ""
+if session and listing:
+    for block in re.split(r"\n(?=Task: )", listing):
+        m = re.search(r"^  Session: (.+)$", block, re.M)
+        if not m or m.group(1).strip() != session:
+            continue
+        m = re.search(r"^  Chat ID: (.+)$", block, re.M)
+        if m:
+            chat = m.group(1).strip()
+        break
+
+stamp = ""
+stamp_age = 99999.0
+stamp_chat = chat
+if chat and (stamp_dir / chat).is_file():
+    stamp, stamp_age = parse_stamp((stamp_dir / chat).read_text(encoding="utf-8", errors="replace"))
+elif (stamp_dir / "latest").is_file():
+    parts = (stamp_dir / "latest").read_text(encoding="utf-8", errors="replace").split()
+    if len(parts) >= 2:
+        stamp_chat = parts[0]
+        rest = " ".join(parts[1:])
+        stamp, stamp_age = parse_stamp(rest)
+
+print(json.dumps({
+    "session": session,
+    "title": title,
+    "chat": chat or stamp_chat,
+    "stamp": stamp,
+    "stamp_age": round(stamp_age, 1),
+    "running": running,
+    "waiting": waiting,
+}, ensure_ascii=False))
+"""
+
+
+def log(path: Path, msg: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write("%s %s\n" % (time.strftime("%H:%M:%S"), msg))
+
+
+def safe_id(name: str) -> str:
+    out = re.sub(r"[^A-Za-z0-9._-]", "_", name or "")
+    return out or "session"
+
+
+def sh_quote(value: str) -> str:
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def proc_text(pid: int, name: str) -> str:
+    try:
+        return Path("/proc/%d/%s" % (pid, name)).read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+def proc_cmdline(pid: int) -> str:
+    try:
+        return (
+            Path("/proc/%d/cmdline" % pid)
+            .read_bytes()
+            .replace(b"\0", b" ")
+            .decode("utf-8", "replace")
+        )
+    except OSError:
+        return ""
+
+
+def proc_ppid(pid: int) -> int:
+    stat = proc_text(pid, "stat")
+    if not stat:
+        return 0
+    rest = stat[stat.rfind(")") + 1 :].split()
+    if len(rest) < 2:
+        return 0
+    try:
+        return int(rest[1])
+    except ValueError:
+        return 0
+
+
+def proc_alive(pid: int) -> bool:
+    return pid > 1 and Path("/proc/%d" % pid).exists()
+
+
+def foot_pid_of(pid: int) -> int:
+    while pid > 1:
+        if proc_text(pid, "comm").strip() == "foot":
+            return pid
+        pid = proc_ppid(pid)
+    return 0
+
+
+def ssh_pid_of(launcher: int) -> int:
+    if launcher <= 1:
+        return 0
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if proc_ppid(pid) != launcher:
+            continue
+        if proc_text(pid, "comm").strip() != "ssh":
+            continue
+        cmdline = proc_cmdline(pid)
+        if "RequestTTY=force" in cmdline or "-tt" in cmdline:
+            return pid
+    return 0
+
+
+def pids_csv(ssh: int, foot: int, launcher: int) -> str:
+    parts = []
+    if ssh > 1:
+        parts.append(str(ssh))
+    if foot > 1:
+        parts.append(str(foot))
+    if launcher > 1:
+        parts.append(str(launcher))
+    return ",".join(parts)
+
+
+def shutil_which(name: str) -> bool:
+    from shutil import which
+
+    return which(name) is not None
+
+
+def report(session: str, state: str, pids: str, log_path: Path) -> None:
+    if not session or not state or not pids:
+        return
+    if not shutil_which("omarchy-shell"):
+        return
+    log(log_path, "report %s id=%s pids=%s" % (state, session, pids))
+    subprocess.Popen(
+        ["omarchy-shell", PLUGIN, "agent", session, state, pids],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+
+def ssh_py(remote: str, agent: str, session: str, script: str, timeout: float = 4.0) -> dict:
+    env = "SESSION=%s AGENT=%s python3 -u -" % (sh_quote(session), sh_quote(agent))
+    try:
+        raw = subprocess.check_output(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=2",
+                remote,
+                env,
+            ],
+            input=script,
+            text=True,
+            timeout=timeout,
+            stderr=subprocess.DEVNULL,
+            env={**os.environ, "SSH_ASKPASS_REQUIRE": "never"},
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return {}
+    try:
+        data = json.loads(raw.strip().splitlines()[-1] if raw.strip() else "{}")
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def classify(data: dict) -> str:
+    if data.get("waiting"):
+        return "waiting"
+    stamp = str(data.get("stamp") or "")
+    try:
+        age = float(data.get("stamp_age") if data.get("stamp_age") is not None else 99999)
+    except (TypeError, ValueError):
+        age = 99999.0
+    running = bool(data.get("running"))
+    if stamp == "waiting" and age < 120:
+        return "waiting"
+    if stamp == "working" and (running or age < STAMP_WORKING_GRACE):
+        return "working"
+    if running:
+        return "working"
+    if stamp == "done" and age < 120:
+        return "done"
+    if stamp == "end":
+        return "end"
+    return ""
+
+
+def decide(prev: str, seen: str, idle_n: int) -> tuple[str, int]:
+    if seen in ("waiting", "working"):
+        return seen, 0
+    if seen == "end":
+        return "end", 0
+    if seen == "done" and prev in ("working", "waiting", "done"):
+        return "done", idle_n
+    if prev in ("working", "waiting"):
+        idle_n += 1
+        if idle_n >= IDLE_POLLS:
+            return "done", idle_n
+        return prev, idle_n
+    return "", idle_n
+
+
+def stamp_src_path() -> Path:
+    here = Path(__file__).resolve().parent / "hooks" / STAMP_NAME
+    if here.is_file():
+        return here
+    return Path.home() / ".config/omarchy/cursor-cli-remote-hooks" / STAMP_NAME
+
+
+def install_hooks(remote: str, stamp_src: Path | None = None) -> bool:
+    stamp_src = stamp_src or stamp_src_path()
+    if not stamp_src.is_file():
+        return False
+    body = stamp_src.read_text(encoding="utf-8")
+    env = {**os.environ, "SSH_ASKPASS_REQUIRE": "never"}
+    upload = (
+        "mkdir -p ~/.cursor/hooks && cat > ~/.cursor/hooks/spaces-forge-stamp.py"
+        " && chmod +x ~/.cursor/hooks/spaces-forge-stamp.py"
+    )
+    try:
+        subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                remote,
+                upload,
+            ],
+            input=body,
+            text=True,
+            timeout=10,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+    merge = r"""
+import json
+from pathlib import Path
+cmd = "./hooks/spaces-forge-stamp.py"
+path = Path.home() / ".cursor" / "hooks.json"
+data = {"version": 1, "hooks": {}}
+if path.is_file():
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(loaded, dict):
+            data = loaded
+    except json.JSONDecodeError:
+        pass
+data.setdefault("hooks", {})
+events = %s
+for event in events:
+    arr = data["hooks"].setdefault(event, [])
+    if not isinstance(arr, list):
+        arr = []
+        data["hooks"][event] = arr
+    if not any(isinstance(x, dict) and x.get("command") == cmd for x in arr):
+        arr.append({"command": cmd})
+path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+""" % (json.dumps(list(HOOK_EVENTS)),)
+    try:
+        subprocess.run(
+            [
+                "ssh",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                remote,
+                "python3 -u -",
+            ],
+            input=merge,
+            text=True,
+            timeout=10,
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return False
+    return True
+
+
+def self_test() -> int:
+    cases = [
+        ("Working… | Hello", "working"),
+        ("Waiting for confirmation", "waiting"),
+        ("Hello There", ""),
+        ("Cursor is waiting for you", ""),
+    ]
+    failed = 0
+    for raw, want in cases:
+        head = raw.split("|", 1)[0].strip()
+        got = ""
+        for s in (head, raw):
+            if re.match(r"Working", s, re.I):
+                got = "working"
+                break
+            if re.match(r"Waiting for (?:confirmation|you)\b", s, re.I):
+                got = "waiting"
+                break
+        if got != want:
+            print("FAIL title %r: got %r want %r" % (raw, got, want))
+            failed += 1
+    pane = [
+        ("Running 5.76k tokens\nCtrl+C to stop", True, False),
+        ("Finished\nRunning 5.76k tokens\nAdd a follow-up\nRun Everything", False, False),
+        ("Waiting for confirmation\nAllow", False, True),
+    ]
+    for raw, want_run, want_wait in pane:
+        waiting = bool(re.search(r"Waiting for (?:confirmation|you)\b", raw, re.I))
+        running = bool(re.search(r"Ctrl\+C to stop", raw, re.I))
+        if (running, waiting) != (want_run, want_wait):
+            print("FAIL pane %r: got %r want %r" % (raw, (running, waiting), (want_run, want_wait)))
+            failed += 1
+    idle, n = "", 0
+    idle, n = decide("working", "", 0)
+    for _ in range(IDLE_POLLS - 1):
+        idle, n = decide(idle, "", n)
+    if idle != "done":
+        print("FAIL debounce: got %r after %s" % (idle, n))
+        failed += 1
+    if classify({"stamp": "working", "stamp_age": 3, "running": False}) != "working":
+        print("FAIL fresh stamp working")
+        failed += 1
+    if classify({"stamp": "working", "stamp_age": 60, "running": False}) != "":
+        print("FAIL stale stamp must drop")
+        failed += 1
+    if classify({"stamp": "working", "stamp_age": 60, "running": True}) != "working":
+        print("FAIL running keeps working")
+        failed += 1
+    if classify({"waiting": True}) != "waiting":
+        print("FAIL waiting")
+        failed += 1
+    if classify({"stamp": "done", "stamp_age": 1}) != "done":
+        print("FAIL stamp done")
+        failed += 1
+    if pids_csv(0, 10, 20) != "10,20":
+        print("FAIL pids without ssh")
+        failed += 1
+    if pids_csv(7, 10, 20) != "7,10,20":
+        print("FAIL pids with ssh")
+        failed += 1
+    if failed:
+        return 1
+    print("spaces-forge-watch self-test ok")
+    return 0
+
+
+def finish(spaces_id: str, pids: str, state_path: Path, log_path: Path) -> None:
+    if spaces_id and pids:
+        report(spaces_id, "end", pids, log_path)
+    if state_path.is_file():
+        try:
+            state_path.unlink()
+        except OSError:
+            pass
+
+
+def watch(args: argparse.Namespace) -> int:
+    log_path = Path(args.log)
+    state_path = Path(args.state)
+    launcher = int(args.launcher)
+    foot = int(args.foot) or foot_pid_of(launcher)
+    name = args.session or ""
+    last = ""
+    last_send = 0.0
+    idle_n = 0
+    last_key = ""
+    ssh = 0
+    saw_ssh = False
+    missed_ssh = 0
+    spaces_id = ""
+    hooks_ok = False
+    hooks_next = 0.0
+    pids = pids_csv(0, foot, launcher)
+    last_good_pids = pids
+    log(log_path, "watch start launcher=%s foot=%s name=%s pids=%s" % (launcher, foot, name or "new", pids))
+
+    stopping = {"flag": False}
+
+    def handle_stop(_signum=None, _frame=None):
+        stopping["flag"] = True
+
+    signal.signal(signal.SIGTERM, handle_stop)
+    signal.signal(signal.SIGINT, handle_stop)
+    signal.signal(signal.SIGHUP, handle_stop)
+
+    while not stopping["flag"]:
+        if not proc_alive(launcher):
+            log(log_path, "launcher gone")
+            break
+        now = time.time()
+        if not hooks_ok and now >= hooks_next:
+            hooks_ok = install_hooks(args.remote)
+            log(log_path, "hooks %s" % ("ok" if hooks_ok else "retry"))
+            hooks_next = now + 60
+        if ssh <= 1 or not proc_alive(ssh):
+            ssh = ssh_pid_of(launcher)
+        if ssh > 1:
+            saw_ssh = True
+            missed_ssh = 0
+        elif saw_ssh:
+            missed_ssh += 1
+            if missed_ssh >= 5:
+                log(log_path, "ssh attach gone")
+                pids = last_good_pids
+                break
+            time.sleep(0.4)
+            continue
+        pids = pids_csv(ssh, foot, launcher)
+        last_good_pids = pids
+        data = ssh_py(args.remote, args.agent, name, POLL_PY)
+        if not data:
+            if last_key != "poll-fail":
+                log(log_path, "poll fail pids=%s" % pids)
+                last_key = "poll-fail"
+            time.sleep(0.4)
+            continue
+        sess = str(data.get("session") or "")
+        if sess and not name:
+            name = sess
+        if name:
+            spaces_id = "forge-%s" % safe_id(name)
+        seen = classify(data)
+        state, idle_n = decide(last, seen, idle_n)
+        key = "%s|%s|%s|%s" % (state or "idle", seen, sess, pids)
+        if key != last_key:
+            log(
+                log_path,
+                "poll %s seen=%s stamp=%s age=%s running=%s waiting=%s sess=%s pids=%s"
+                % (
+                    state or "idle",
+                    seen,
+                    data.get("stamp") or "-",
+                    data.get("stamp_age") if data.get("stamp_age") is not None else "-",
+                    int(bool(data.get("running"))),
+                    int(bool(data.get("waiting"))),
+                    sess,
+                    pids,
+                ),
+            )
+            last_key = key
+        now = time.time()
+        if spaces_id and pids and state:
+            if state != last or (
+                state in ("working", "waiting") and now - last_send >= 15
+            ):
+                if state == "end":
+                    report(spaces_id, "end", pids, log_path)
+                    last = ""
+                else:
+                    report(spaces_id, state, pids, log_path)
+                    last = state
+                last_send = now
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                state_path.write_text("%s %s %s\n" % (spaces_id, state, pids), encoding="utf-8")
+        elif spaces_id and pids and not last and not state:
+            report(spaces_id, "end", pids, log_path)
+            last = "idle"
+            last_send = now
+        time.sleep(0.4)
+
+    finish(spaces_id, pids, state_path, log_path)
+    return 0
+
+
+def iter_pids() -> list[int]:
+    out = []
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            out.append(int(entry.name))
+    return out
+
+
+def live_attaches() -> list[tuple[int, int, str]]:
+    found = []
+    for pid in iter_pids():
+        if proc_text(pid, "comm").strip() != "ssh":
+            continue
+        cmdline = proc_cmdline(pid)
+        if "RequestTTY=force" not in cmdline and "-tt" not in cmdline:
+            continue
+        if "persist attach" not in cmdline:
+            continue
+        m = re.search(r"persist attach (\S+)", cmdline)
+        session = m.group(1) if m else ""
+        launcher = proc_ppid(pid)
+        if launcher <= 1:
+            continue
+        if "cursor-cli-remote" not in proc_cmdline(launcher):
+            continue
+        foot = foot_pid_of(launcher)
+        found.append((launcher, foot, session))
+    return found
+
+
+def kill_watchers(launcher: int) -> None:
+    protected = {launcher, ssh_pid_of(launcher), foot_pid_of(launcher)}
+    for pid in iter_pids():
+        if pid in protected or pid <= 1:
+            continue
+        cmdline = proc_cmdline(pid)
+        comm = proc_text(pid, "comm").strip()
+        ppid = proc_ppid(pid)
+        watch = "spaces-forge-watch" in cmdline and (
+            "--launcher %d" % launcher in cmdline or "--launcher=%d" % launcher in cmdline
+        )
+        old_bash = (
+            ppid == launcher
+            and comm == "bash"
+            and "cursor-cli-remote" in cmdline
+        )
+        if watch or old_bash:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+
+def adopt(args: argparse.Namespace) -> int:
+    log_path = Path(args.log)
+    watch_bin = str(Path(__file__).resolve())
+    started = 0
+    for launcher, foot, session in live_attaches():
+        kill_watchers(launcher)
+        time.sleep(0.2)
+        runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+        state = str(runtime / ("cursor-cli-remote-spaces.%s" % launcher))
+        cmd = [
+            watch_bin,
+            "--launcher",
+            str(launcher),
+            "--foot",
+            str(foot),
+            "--session",
+            session,
+            "--remote",
+            args.remote,
+            "--agent",
+            args.agent,
+            "--state",
+            state,
+            "--log",
+            str(log_path),
+        ]
+        subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        log(log_path, "adopt launcher=%s foot=%s session=%s" % (launcher, foot, session))
+        print("adopted launcher=%s foot=%s session=%s" % (launcher, foot, session))
+        started += 1
+    if not started:
+        print("no live forge attach")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Spaces reporter for Cursor Forge CLI")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--install-hooks", action="store_true")
+    parser.add_argument("--adopt", action="store_true")
+    parser.add_argument("--launcher", type=int, default=0)
+    parser.add_argument("--foot", type=int, default=0)
+    parser.add_argument("--session", default="")
+    parser.add_argument("--remote", default=os.environ.get("CURSOR_REMOTE", "forge"))
+    parser.add_argument("--agent", default=os.environ.get("CURSOR_REMOTE_AGENT", ""))
+    parser.add_argument(
+        "--log",
+        default=str(
+            Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local/state"))
+            / "omarchy/spaces-forge-watch.log"
+        ),
+    )
+    parser.add_argument("--state", default="")
+    args = parser.parse_args()
+    if args.self_test:
+        return self_test()
+    if not args.agent:
+        args.agent = str(Path.home() / ".local/bin/agent")
+    if args.install_hooks:
+        ok = install_hooks(args.remote)
+        print("hooks installed on %s" % args.remote if ok else "hooks install failed on %s" % args.remote)
+        return 0 if ok else 1
+    if args.adopt:
+        return adopt(args)
+    if not args.state:
+        runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
+        args.state = str(runtime / ("cursor-cli-remote-spaces.%s" % (args.launcher or os.getpid())))
+    if args.launcher <= 1:
+        parser.error("--launcher is required")
+    return watch(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

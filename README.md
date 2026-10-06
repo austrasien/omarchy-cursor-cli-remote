@@ -43,6 +43,10 @@ Defaults match a host alias `forge`, workdir `$HOME/work`, and `~/.local/bin/age
 
 Foot class: `org.omarchy.agent.forge` so [agent-title](https://github.com/austrasien/omarchy-agent-title) can paint the bar mauve (`#cba6f7`) instead of the Mars orange accent.
 
+While a session is attached, `spaces-forge-watch` reports Cursor status to the [Spaces](https://github.com/austrasien/omarchy-spaces) bar (`omarchy-shell tornikegomareli.spaces agent …`) with this window’s PIDs (`ssh`, Foot, launcher). Cursor on the remote cannot talk to Spaces; a stamp hook (`~/.cursor/hooks/spaces-forge-stamp.py`) writes `working` / `done` / `end` under `$XDG_RUNTIME_DIR/spaces-forge/`. The laptop watcher polls those stamps, with TUI fallback via `tmux capture-pane` (`Ctrl+C to stop` → gold chip, `Waiting for confirmation` → `!`). Stale `working` stamps expire if the TUI is idle. `end` when you return to the mauve menu, close the window, or the ssh attach dies. `./install.sh` copies the watcher, installs the remote hook, and adopts a live attach — no re-open required.
+
+`./cursor-cli-remote --spaces-self-test` (or `spaces-forge-watch --self-test`) checks the mapping.
+
 ## Install (Omarchy)
 
 **Requirements:** `ssh`, `python3`, [gum](https://github.com/charmbracelet/gum), Foot, Cursor CLI `agent` on the **remote**, SSH host alias (ControlMaster recommended). Persist attach needs a TTY (`ssh -tt`).

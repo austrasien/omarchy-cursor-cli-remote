@@ -7,6 +7,7 @@ BIN_OMARCHY="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/bin"
 BIN_LOCAL="${XDG_BIN_HOME:-$HOME/.local/bin}"
 APPS="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/cursor-cli-remote.env"
+HOOKS="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/cursor-cli-remote-hooks"
 FOOT_INI="${XDG_CONFIG_HOME:-$HOME/.config}/foot/agent.ini"
 APP_ID="org.omarchy.agent.forge"
 
@@ -14,10 +15,12 @@ usage() {
   cat <<'EOF'
 Usage: ./install.sh
 
-Copies cursor-cli-remote into ~/.config/omarchy/bin, keeps the
-cursor-forge-persist name as a symlink, installs a Super+Space
-desktop entry, and writes cursor-cli-remote.env if missing.
-Does not patch /usr/share/omarchy.
+Copies cursor-cli-remote and spaces-forge-watch into
+~/.config/omarchy/bin, keeps the cursor-forge-persist name as a
+symlink, installs a Super+Space desktop entry, writes
+cursor-cli-remote.env if missing, installs Spaces stamps on the
+remote, and adopts any live Forge attach. Does not patch
+/usr/share/omarchy.
 EOF
   exit 2
 }
@@ -43,9 +46,11 @@ if ((${#MISSING[@]})); then
   exit 1
 fi
 
-mkdir -p "$BIN_OMARCHY" "$BIN_LOCAL" "$APPS" "$(dirname "$CONFIG")"
+mkdir -p "$BIN_OMARCHY" "$BIN_LOCAL" "$APPS" "$HOOKS" "$(dirname "$CONFIG")"
 
 install -m 0755 "$ROOT/cursor-cli-remote" "$BIN_OMARCHY/cursor-cli-remote"
+install -m 0755 "$ROOT/spaces-forge-watch" "$BIN_OMARCHY/spaces-forge-watch"
+install -m 0755 "$ROOT/hooks/spaces-forge-stamp.py" "$HOOKS/spaces-forge-stamp.py"
 ln -sfn "$BIN_OMARCHY/cursor-cli-remote" "$BIN_OMARCHY/cursor-forge-persist"
 ln -sfn "$BIN_OMARCHY/cursor-cli-remote" "$BIN_LOCAL/cursor-cli-remote"
 ln -sfn "$BIN_OMARCHY/cursor-cli-remote" "$BIN_LOCAL/cursor-forge-persist"
@@ -88,6 +93,26 @@ if command -v update-desktop-database >/dev/null; then
   update-desktop-database "$APPS" >/dev/null 2>&1 || true
 fi
 
+REMOTE_NAME="${CURSOR_REMOTE:-forge}"
+AGENT_PATH="${CURSOR_REMOTE_AGENT:-$HOME/.local/bin/agent}"
+if [[ -f "$CONFIG" ]]; then
+  set +e
+  set -a
+  # shellcheck disable=SC1090
+  source "$CONFIG"
+  set +a
+  set -e
+  REMOTE_NAME="${CURSOR_REMOTE:-forge}"
+  AGENT_PATH="${CURSOR_REMOTE_AGENT:-$HOME/.local/bin/agent}"
+fi
+
+"$BIN_OMARCHY/spaces-forge-watch" --self-test
+if ! "$BIN_OMARCHY/spaces-forge-watch" --install-hooks --remote "$REMOTE_NAME" --agent "$AGENT_PATH"; then
+  printf 'Spaces hooks on %s: skipped (SSH later, or next attach)\n' "$REMOTE_NAME"
+fi
+"$BIN_OMARCHY/spaces-forge-watch" --adopt --remote "$REMOTE_NAME" --agent "$AGENT_PATH"
+
 printf 'Installed %s\n' "$BIN_OMARCHY/cursor-cli-remote"
+printf 'Watch: %s\n' "$BIN_OMARCHY/spaces-forge-watch"
 printf 'Desktop: %s/Cursor Forge CLI.desktop\n' "$APPS"
 printf 'Super+Space → Cursor Forge CLI\n'

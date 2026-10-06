@@ -45,7 +45,7 @@ AGENT="${CURSOR_REMOTE_AGENT:-$HOME/.local/bin/agent}"
 WINDOW_TITLE="${CURSOR_REMOTE_TITLE:-Cursor Forge}"
 MAX_AGE_SECS="${CURSOR_REMOTE_MAX_AGE_SECS:-$((7 * 24 * 3600))}"
 THEME_COLORS="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current/theme/colors.toml"
-SHORTCUTS="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+SHORTCUTS="123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 export GHOSTTY_RESOURCES_DIR="${GHOSTTY_RESOURCES_DIR:-1}"
 
@@ -65,6 +65,7 @@ BG="$(theme_color background '#121212')"
 
 FORGE_HOST=""
 FORGE_USER=""
+FORGE_PORT="22"
 FORGE_CONTROL=""
 FORGE_IDENTS=()
 
@@ -72,12 +73,14 @@ load_ssh_meta() {
   local k v ident
   FORGE_HOST=""
   FORGE_USER=""
+  FORGE_PORT="22"
   FORGE_CONTROL=""
   FORGE_IDENTS=()
   while read -r k v; do
     case "${k,,}" in
       hostname) FORGE_HOST="$v" ;;
       user) FORGE_USER="$v" ;;
+      port) FORGE_PORT="$v" ;;
       controlpath) FORGE_CONTROL="$v" ;;
       identityfile)
         ident="${v/#\~/$HOME}"
@@ -91,12 +94,79 @@ load_ssh_meta() {
   )
   [[ -n "$FORGE_HOST" ]] || FORGE_HOST="$REMOTE"
   [[ -n "$FORGE_USER" ]] || FORGE_USER="${USER:-austraz}"
+  [[ "$FORGE_PORT" =~ ^[0-9]+$ ]] || FORGE_PORT=22
 }
 
 load_ssh_meta
 
 ssh_forge() {
   SSH_ASKPASS_REQUIRE=never ssh -o ConnectTimeout=8 "$REMOTE" "$@"
+}
+
+# Spaces agent badge: laptop omarchy-shell + this window's PIDs.
+# Remote Cursor writes stamps; spaces-forge-watch maps them here.
+SPACES_ATTACH_ID=""
+SPACES_WATCH_PID=""
+SPACES_WATCH_STATE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/cursor-cli-remote-spaces.$$"
+SPACES_WATCH_LOG="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/spaces-forge-watch.log"
+
+spaces_watch_bin() {
+  local here cand
+  here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+  for cand in \
+    "$here/spaces-forge-watch" \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/bin/spaces-forge-watch"
+  do
+    [[ -x $cand ]] && { printf '%s' "$cand"; return 0; }
+  done
+  return 1
+}
+
+spaces_foot_pid() {
+  local pid=${1:-$$} comm stat
+  while [[ $pid -gt 1 && -r /proc/$pid/comm ]]; do
+    comm=$(<"/proc/$pid/comm")
+    [[ $comm == foot ]] && { printf '%s' "$pid"; return 0; }
+    stat=$(<"/proc/$pid/stat")
+    stat=${stat##*) }
+    read -r _ pid _ <<<"$stat"
+  done
+  return 1
+}
+
+spaces_watch_stop() {
+  if [[ -n ${SPACES_WATCH_PID:-} ]]; then
+    kill -TERM "$SPACES_WATCH_PID" 2>/dev/null || true
+    wait "$SPACES_WATCH_PID" 2>/dev/null || true
+    SPACES_WATCH_PID=""
+  fi
+  trap - HUP TERM
+}
+
+spaces_watch_start() {
+  local name=$1 bin foot=0
+  spaces_watch_stop
+  bin=$(spaces_watch_bin) || return 0
+  foot=$(spaces_foot_pid $$) || foot=0
+  "$bin" \
+    --launcher $$ \
+    --foot "${foot:-0}" \
+    --session "$name" \
+    --remote "$REMOTE" \
+    --agent "$AGENT" \
+    --state "$SPACES_WATCH_STATE" \
+    --log "$SPACES_WATCH_LOG" &
+  SPACES_WATCH_PID=$!
+  trap 'spaces_watch_stop; exit 129' HUP TERM
+}
+
+spaces_self_test() {
+  local bin
+  bin=$(spaces_watch_bin) || {
+    printf 'spaces-forge-watch missing\n' >&2
+    return 1
+  }
+  "$bin" --self-test
 }
 
 flush_tty() {
@@ -120,15 +190,114 @@ finally:
 
 restore_tty() {
   stty sane < /dev/tty 2>/dev/null || true
+  # ssh / FIDO leave application-keypad and mouse modes; stty sane does not.
+  printf '\033[?1l\033[?7h\033[?25h\033[?2004l\033[?1000l\033[?1002l\033[?1003l\033[?1006l\033[?1049l' >/dev/tty 2>/dev/null || true
   flush_tty
 }
 
+# Echo off so a PIN typed before ssh takes the TTY cannot leak in clear.
+# Canonical input stays on so ssh's FIDO prompt can read a line + Enter.
+prep_tty_for_pin() {
+  stty sane < /dev/tty 2>/dev/null || true
+  stty -echo < /dev/tty 2>/dev/null || true
+  flush_tty
+}
+
+FORGE_TCP_WHY=""
+
+forge_tcp_ok() {
+  local out st=0
+  [[ -n "$FORGE_HOST" ]] || load_ssh_meta
+  FORGE_TCP_WHY=""
+  set +e
+  out="$(python3 -c '
+import socket, sys
+host, port, timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+sock.settimeout(timeout)
+try:
+    sock.connect((host, port))
+except Exception as exc:
+    sys.stdout.write("connect:%s" % exc)
+    raise SystemExit(1)
+try:
+    banner = sock.recv(256)
+except Exception as exc:
+    sys.stdout.write("recv:%s" % exc)
+    raise SystemExit(1)
+finally:
+    sock.close()
+text = banner.decode("utf-8", "replace").strip()
+if banner.startswith(b"SSH-"):
+    raise SystemExit(0)
+sys.stdout.write(text or "empty")
+raise SystemExit(2)
+' "$FORGE_HOST" "$FORGE_PORT" 5)"
+  st=$?
+  set -e
+  FORGE_TCP_WHY="$out"
+  return "$st"
+}
+
+# 0 running, 1 stopped/starting, 2 needs login, 3 tailscale missing (treat as ok).
+tailscale_state() {
+  command -v tailscale >/dev/null 2>&1 || return 3
+  python3 -c '
+import json, subprocess, sys
+try:
+    raw = subprocess.check_output(
+        ["tailscale", "status", "--json"],
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+except Exception:
+    raise SystemExit(1)
+try:
+    data = json.loads(raw)
+except Exception:
+    raise SystemExit(1)
+state = data.get("BackendState") or ""
+if state == "Running":
+    raise SystemExit(0)
+if state == "NeedsLogin":
+    raise SystemExit(2)
+raise SystemExit(1)
+'
+}
+
+ensure_tailscale() {
+  local st=0 i
+  tailscale_state
+  st=$?
+  ((st == 0 || st == 3)) && return 0
+  ((st == 2)) && return 2
+  draw_status "${REMOTE}  ·  Tailscale…" "$TS_BODY"
+  set +e
+  tailscale up >/dev/null 2>&1
+  set -e
+  for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    tailscale_state
+    st=$?
+    ((st == 0)) && return 0
+    ((st == 2)) && return 2
+    sleep 0.5
+  done
+  return 1
+}
+
 ssh_forge_tty() {
+  local st=0
   restore_tty
   clear || true
   unset SSH_ASKPASS
+  spaces_watch_start "${SPACES_ATTACH_ID:-}"
+  set +e
   SSH_ASKPASS_REQUIRE=never ssh -tt -o RequestTTY=force -o ConnectTimeout=8 \
     "$REMOTE" "$@" </dev/tty >/dev/tty 2>/dev/tty
+  st=$?
+  set -e
+  spaces_watch_stop
+  return "$st"
 }
 
 FETCH_PY='
@@ -287,7 +456,8 @@ header_sub() {
 MENU_PY='
 import fcntl, glob, os, select, struct, sys, termios, time, tty, unicodedata
 
-SHORTCUTS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+SHORTCUTS = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+AZERTY_ROW = dict(zip("&é\"" + chr(39) + "(-è_çà", "1234567890"))
 PAD_X, PAD_Y = 2, 1
 MIN_INNER = 52
 
@@ -306,6 +476,7 @@ TITLE = os.environ.get("TITLE", "Cursor Forge")
 SUB = os.environ.get("SUB", "forge  ·  persist")
 HINT = os.environ.get("HINT", "0–9 A…  →/⏎  ouvrir     ↑↓     ⌫  supprimer     esc")
 MODE = os.environ.get("MODE", "pick")
+AUTO_YUBI = os.environ.get("AUTO_YUBI", "1") != "0"
 BODY_LINES = [ln for ln in os.environ.get("BODY", "").split("\n") if ln]
 
 def yubikey_plugged():
@@ -356,11 +527,19 @@ for row in rows_in:
     labels.append(label)
     ids.append(ident)
     k = label[:1]
+    if ident == "[new]":
+        for nk in ("n", "N", "+"):
+            keys[nk] = ident
+        continue
     if k in SHORTCUTS:
         keys[k] = ident
         keys[k.lower()] = ident
 if MODE == "pick" and not labels:
     sys.exit(1)
+
+def shortcut_lookup(key):
+    key = AZERTY_ROW.get(key, key)
+    return keys.get(key)
 
 fd = os.open("/dev/tty", os.O_RDWR)
 ui = os.fdopen(os.dup(fd), "w", buffering=1)
@@ -402,7 +581,7 @@ def quiet_drain(seconds=0.08):
 def read_key():
     ch = os.read(fd, 1)
     if not ch:
-        return "esc"
+        return "ignore"
     if ch in (b"\r", b"\n"):
         return "enter"
     if ch in (b"\x7f", b"\x08"):
@@ -535,13 +714,30 @@ def paint_box():
     ui.flush()
     return row, term_r
 
+hid_ignore_until = 0.0
+was_yubi = yubikey_plugged()
+
+def note_yubi():
+    global hid_ignore_until, was_yubi
+    now_yubi = yubikey_plugged()
+    if now_yubi != was_yubi:
+        hid_ignore_until = time.monotonic() + 0.6
+        drain()
+        was_yubi = now_yubi
+    return now_yubi
+
+def hid_quiet():
+    return time.monotonic() < hid_ignore_until
+
 try:
     if MODE == "wait":
         drain()
         tty.setraw(fd)
         try:
             while True:
-                if yubikey_plugged():
+                note_yubi()
+                if AUTO_YUBI and was_yubi:
+                    quiet_drain(0.45)
                     restore()
                     sys.exit(0)
                 paint_box()
@@ -549,6 +745,8 @@ try:
                 if not r:
                     continue
                 key = read_key()
+                if hid_quiet() or key == "ignore":
+                    continue
                 if key == "esc":
                     restore()
                     sys.exit(130)
@@ -570,11 +768,18 @@ try:
         sys.exit(0)
     drain()
     tty.setraw(fd)
+    idx = 1 if len(labels) > 1 else 0
     paint_box()
     drain()
     quiet_drain()
     while True:
+        note_yubi()
+        r, _, _ = select.select([fd], [], [], 0.2)
+        if not r:
+            continue
         key = read_key()
+        if hid_quiet() or key == "ignore":
+            continue
         if key == "esc":
             restore()
             sys.exit(130)
@@ -586,12 +791,13 @@ try:
             idx = (idx + 1) % len(labels)
             paint_box()
             continue
-        if key == "left" or key == "ignore":
+        if key == "left":
             continue
         action = None
         ident = None
-        if key in keys:
-            action, ident = "open", keys[key]
+        hit = shortcut_lookup(key)
+        if hit is not None:
+            action, ident = "open", hit
         elif key in ("enter", "right"):
             action, ident = "open", ids[idx]
         elif key == "bspace":
@@ -618,7 +824,7 @@ choose() {
   local sub="$1"
   restore_tty
   MODE=pick TITLE="$WINDOW_TITLE" SUB="$sub" \
-    HINT="0–9 A…  →/⏎  ouvrir     ↑↓     ⌫  supprimer     esc" \
+    HINT="n  nouvelle     1–9 A…  ouvrir     ↑↓     ⌫  supprimer     esc" \
     ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
     python3 -c "$MENU_PY"
 }
@@ -752,10 +958,16 @@ rehome_mux() {
 
 draw_wait() {
   local sub="$1"
+  local body="${2:-$YUBI_BODY}"
+  local auto_yubi="${3:-1}"
+  local hint="Entrée  réessayer     esc  fermer"
+  if [[ "$auto_yubi" == 1 ]]; then
+    hint+="     reprise auto dès la clé"
+  fi
   restore_tty
-  MODE=wait TITLE="$WINDOW_TITLE" SUB="$sub" \
-    HINT="Entrée  réessayer     esc  fermer     reprise auto dès la clé" \
-    BODY="$YUBI_BODY" \
+  AUTO_YUBI="$auto_yubi" MODE=wait TITLE="$WINDOW_TITLE" SUB="$sub" \
+    HINT="$hint" \
+    BODY="$body" \
     ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
     python3 -c "$MENU_PY" </dev/null >/dev/tty
 }
@@ -763,12 +975,43 @@ draw_wait() {
 PIN_BODY=$'1. Tape le PIN FIDO2, puis Entrée.
 2. Touche le pad or.'
 
+CONNECT_BODY=$'Ouverture du tunnel SSH vers forge…'
+
+TS_BODY=$'Tailscale est arrêté. Reconnexion au tailnet…'
+
+TS_FAIL_BODY=$'Tailscale n'\''a pas pu se reconnecter.
+Entrée pour réessayer, esc pour fermer.'
+
+TS_LOGIN_BODY=$'Tailscale n'\''est pas connecté au compte (login requis).
+Lance tailscale login, puis Entrée ici.'
+
+UNREACH_BODY=$'TCP vers forge a échoué — le PIN FIDO n'\''est pas encore demandé.
+Tailscale a été relancé si besoin. Entrée pour réessayer.'
+
+ssh_refuse_body() {
+  local detail="${1:-refus SSH}"
+  printf '%s\n%s\n' \
+    "Le port 22 répond, mais ce n'est pas sshd :" \
+    "$detail"
+}
+
+draw_status() {
+  local sub="$1"
+  local body="${2:-$CONNECT_BODY}"
+  restore_tty
+  MODE=pin TITLE="$WINDOW_TITLE" SUB="$sub" \
+    BODY="$body" \
+    ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
+    python3 -c "$MENU_PY" </dev/null >/dev/tty
+}
+
 draw_pin() {
   restore_tty
   MODE=pin TITLE="$WINDOW_TITLE" SUB="${REMOTE}  ·  PIN FIDO2" \
     BODY="$PIN_BODY" \
     ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
     python3 -c "$MENU_PY" </dev/null >/dev/tty
+  prep_tty_for_pin
 }
 
 # One IdentityFile per attempt. Putting both in ssh_config makes OpenSSH
@@ -776,16 +1019,17 @@ draw_pin() {
 # a process substitution + set -e aborts the launcher right after PIN.
 open_master() {
   local ident st=1 i
-  restore_tty
   unset SSH_ASKPASS
   [[ -n "$FORGE_HOST" ]] || load_ssh_meta
   drop_stale_master
   mkdir -p "$(dirname "${FORGE_CONTROL:-$HOME/.ssh/sockets/x}")"
+  prep_tty_for_pin
   for ident in "${FORGE_IDENTS[@]}"; do
     [[ -r "$ident" ]] || continue
     set +e
     SSH_ASKPASS_REQUIRE=never ssh -F /dev/null \
       -o ConnectTimeout=8 \
+      -o ConnectionAttempts=1 \
       -o BatchMode=no \
       -o PreferredAuthentications=publickey \
       -o NumberOfPasswordPrompts=0 \
@@ -802,13 +1046,21 @@ open_master() {
     set +e
     if ((st == 0)); then
       for i in 1 2 3 4 5 6 7 8 9 10; do
-        ssh_master_ok && return 0
+        if ssh_master_ok; then
+          restore_tty
+          return 0
+        fi
         sleep 0.1
       done
+      restore_tty
       return 0
     fi
-    ssh_master_ok && return 0
+    if ssh_master_ok; then
+      restore_tty
+      return 0
+    fi
   done
+  restore_tty
   return "$st"
 }
 
@@ -820,6 +1072,26 @@ ensure_forge() {
     return 0
   fi
   while true; do
+    set +e
+    ensure_tailscale
+    st=$?
+    set -e
+    if ((st == 2)); then
+      set +e
+      draw_wait "${REMOTE}  ·  Tailscale login" "$TS_LOGIN_BODY" 0
+      wait_st=$?
+      set -e
+      ((wait_st == 130)) && exit 0
+      continue
+    fi
+    if ((st != 0)); then
+      set +e
+      draw_wait "${REMOTE}  ·  Tailscale down" "$TS_FAIL_BODY" 0
+      wait_st=$?
+      set -e
+      ((wait_st == 130)) && exit 0
+      continue
+    fi
     if ! yubikey_present; then
       set +e
       draw_wait "${REMOTE}  ·  YubiKey absente"
@@ -828,6 +1100,27 @@ ensure_forge() {
       ((wait_st == 130)) && exit 0
       yubikey_present || continue
       sleep 1
+    fi
+    draw_status "${REMOTE}  ·  connexion…"
+    set +e
+    forge_tcp_ok
+    st=$?
+    set -e
+    if ((st == 1)); then
+      set +e
+      draw_wait "${REMOTE}  ·  injoignable" "$UNREACH_BODY" 0
+      wait_st=$?
+      set -e
+      ((wait_st == 130)) && exit 0
+      continue
+    fi
+    if ((st != 0)); then
+      set +e
+      draw_wait "${REMOTE}  ·  refus SSH" "$(ssh_refuse_body "${FORGE_TCP_WHY:-refus}")" 0
+      wait_st=$?
+      set -e
+      ((wait_st == 130)) && exit 0
+      continue
     fi
     draw_pin
     set +e
@@ -843,7 +1136,11 @@ ensure_forge() {
     restore_tty
     clear || true
     set +e
-    draw_wait "${REMOTE}  ·  ${why} — réessaie"
+    if [[ "$why" == "YubiKey absente" ]]; then
+      draw_wait "${REMOTE}  ·  ${why} — réessaie"
+    else
+      draw_wait "${REMOTE}  ·  ${why} — réessaie" "$YUBI_BODY" 0
+    fi
     wait_st=$?
     set -e
     ((wait_st == 130)) && exit 0
@@ -851,11 +1148,13 @@ ensure_forge() {
 }
 
 new_session() {
+  SPACES_ATTACH_ID=""
   ssh_forge_tty "cd $(printf '%q' "$REMOTE_DIR") && exec $AGENT persist --trust"
 }
 
 attach_session() {
   local name="$1"
+  SPACES_ATTACH_ID="$name"
   ssh_forge_tty "cd $(printf '%q' "$REMOTE_DIR") && exec $AGENT persist attach $(printf '%q' "$name")"
 }
 
@@ -877,6 +1176,11 @@ stop_session() {
   local name="$1"
   ssh_forge "$AGENT persist stop $(printf '%q' "$name")"
 }
+
+if [[ "${1:-}" == --spaces-self-test ]]; then
+  spaces_self_test
+  exit 0
+fi
 
 printf '\e]0;%s\a' "$WINDOW_TITLE" || true
 declare -A TASK_BY_ID=()
@@ -922,7 +1226,7 @@ while true; do
 
   options=()
   TASK_BY_ID=()
-  options+=("+  Nouvelle session"$'\t'"[new]")
+  options+=("n  Nouvelle session"$'\t'"[new]")
   i=0
   for row in "${rows[@]+"${rows[@]}"}"; do
     IFS=$'\t' read -r name task status created <<<"$row"
