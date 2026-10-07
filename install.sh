@@ -112,6 +112,7 @@ if [[ -f "$CONFIG" ]]; then
 fi
 
 "$BIN_OMARCHY/cursor-cli-remote" --spaces-self-test
+"$ROOT/test-set-e-survive.sh"
 if ! "$BIN_OMARCHY/spaces-forge-watch" --install-hooks --remote "$REMOTE_NAME" --agent "$AGENT_PATH"; then
   printf 'Spaces hooks on %s: skipped (SSH later, or next attach)\n' "$REMOTE_NAME"
 fi

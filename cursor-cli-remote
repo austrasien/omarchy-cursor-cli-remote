@@ -39,6 +39,11 @@ if [[ -f "$CONFIG" ]]; then
   ((src_status == 0)) || die "Config invalide: $CONFIG"
 fi
 
+# Interactive launcher: non-zero returns are control flow (TCP probe, wait UI,
+# ssh auth). Keeping set -e armed lets any helper `return 1` kill Foot — that
+# is what closed the window after YubiKey wait (EXIT status=2).
+set +e
+
 REMOTE="${CURSOR_REMOTE:-forge}"
 REMOTE_DIR="${CURSOR_REMOTE_DIR:-$HOME/work}"
 AGENT="${CURSOR_REMOTE_AGENT:-$HOME/.local/bin/agent}"
@@ -313,11 +318,9 @@ ssh_forge_tty() {
   clear || true
   unset SSH_ASKPASS
   spaces_watch_start "${SPACES_ATTACH_ID:-}"
-  set +e
   SSH_ASKPASS_REQUIRE=never ssh -tt -o RequestTTY=force -o ConnectTimeout=8 \
     "$REMOTE" "$@" </dev/tty >/dev/tty 2>/dev/tty
   st=$?
-  set -e
   spaces_watch_stop
   return "$st"
 }
@@ -664,14 +667,12 @@ ensure_mux_unit() {
   local unit="$1" out st=0
   systemctl --user is-active --quiet "$unit" && return 0
   systemctl --user reset-failed "$unit" 2>/dev/null || true
-  set +e
   out=$(systemd-run --user --quiet --collect \
     --unit="$unit" \
     --property=Delegate=yes \
     --property=Slice=app.slice \
     /usr/bin/sleep infinity 2>&1)
   st=$?
-  set -e
   if ((st != 0)); then
     flog "ensure_mux_unit fail unit=$unit st=$st out=$out"
     return 1
@@ -697,10 +698,8 @@ rehome_mux() {
     flog "rehome_mux fail: busctl missing — mux stays in Foot cgroup"
     return 1
   fi
-  set +e
   pid="$(mux_pid_for_socket "$sock")"
   st=$?
-  set -e
   if ((st != 0)) || [[ -z "$pid" ]]; then
     MUX_REHOME_WARN="PID mux introuvable"
     flog "rehome_mux fail: mux pid not found for $sock"
@@ -716,18 +715,16 @@ rehome_mux() {
     flog "rehome_mux fail: ensure_mux_unit $unit"
     return 1
   fi
-  set +e
   out=$(busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
     org.freedesktop.systemd1.Manager AttachProcessesToUnit \
     ssau "$unit" / 1 "$pid" 2>&1)
   st=$?
-  set -e
   if ((st != 0)); then
     MUX_REHOME_WARN="attach mux KO"
     flog "rehome_mux fail: AttachProcessesToUnit st=$st pid=$pid out=$out"
     return 1
   fi
-  sleep 0.05
+  sleep 0.05 || true
   if ! mux_in_unit "$pid" "$unit"; then
     cg="$(tr '\n' ' ' <"/proc/${pid}/cgroup" 2>/dev/null | head -c 240 || true)"
     MUX_REHOME_WARN="mux encore dans Foot"
@@ -769,15 +766,14 @@ draw_wait() {
     hint="Entrée  réessayer     esc×2 (lent)  fermer"
   fi
   restore_tty
-  set +e
   AUTO_YUBI="$auto_yubi" MODE=wait TITLE="$WINDOW_TITLE" SUB="$sub" \
     HINT="$hint" \
     BODY="$body" \
     ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
     run_tui wait </dev/null >/dev/tty
   st=$?
-  set -e
   flog "draw_wait auto_yubi=$auto_yubi sub=$sub exit=$st"
+  # Never set -e before this return: wait exit 130/1 is normal control flow.
   return "$st"
 }
 
@@ -995,10 +991,8 @@ attach_session() {
 }
 
 run_session() {
-  set +e
   "$@"
   local st=$?
-  set -e
   restore_tty
   if ((st != 0)); then
     printf '\n'
@@ -1095,10 +1089,8 @@ while true; do
   action=""
   sel=""
   id=""
-  set +e
   out="$(printf '%s\n' "${options[@]}" | choose "$(header_sub "$count" "$prune_note")")"
   choose_status=$?
-  set -e
   if ((choose_status == 130 || choose_status == 1)); then
     exit 0
   fi
