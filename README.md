@@ -8,6 +8,8 @@ A **Super+Space launcher** that lists Cursor **`agent persist`** sessions on an 
 Super+Space “Cursor Forge CLI”  →  SSH  →  agent persist list / attach / stop
 ```
 
+**Layout:** `cursor-cli-remote` (bash) + `forge_tui.py` (mauve menu, testable) + `spaces-forge-watch` (Spaces badge).
+
 ---
 
 ### ☕ Support the Project
@@ -53,7 +55,17 @@ While a session is attached, `spaces-forge-watch` reports Cursor status to the [
 
 If the SSH key is FIDO (`ed25519-sk`) and the YubiKey is unplugged, the mauve box stays open: plug USB-C, PIN if asked, touch the gold pad. The launcher retries as soon as vendor `1050` appears; Esc closes. Each `IdentityFile` is tried on its own so the unplugged key does not dump `device not found` over the TUI. PIN / touch prompts stay below the mauve box.
 
-The SSH ControlMaster is moved out of Foot’s systemd scope into `ssh-<host>-mux.service` (`Delegate=yes`) so closing the window does not kill the mux. The next launch reuses the tunnel until the 04:00 `ssh-forge-close.timer` (or `ssh-forge-expire.sh` after suspend).
+### SSH mux lifetime
+
+| Layer | Role |
+| :--- | :--- |
+| **04:00 local** | Hard cutoff — `ssh-forge-close.timer` + `Match host forge exec ssh-forge-expire.sh` |
+| **`ControlPersist` (default `20h`)** | Safety net if the laptop was suspended over 04:00 |
+| **`rehome_mux`** | Moves the mux PID into `ssh-<host>-mux.service` so closing Foot does **not** demand the YubiKey again the same day |
+
+If rehome fails, the TUI warns and logs to `~/.local/state/omarchy/cursor-cli-remote.log` (`⚠ mux Foot` in the subtitle). Override persist with `CURSOR_REMOTE_MUX_PERSIST` in the env file.
+
+YubiKey OTP injects Esc/Ctrl+C as a USB keyboard: the TUI ignores Ctrl+C in wait mode, keeps a 4s quiet window after plug, and only quits on a **slow** esc×2 (min 350ms between presses).
 
 ```sh
 git clone https://github.com/austrasien/omarchy-cursor-cli-remote.git
@@ -74,6 +86,14 @@ CURSOR_REMOTE_AGENT="$HOME/.local/bin/agent"
 CURSOR_REMOTE_TITLE="Cursor Forge"
 CURSOR_REMOTE_ACCENT="#cba6f7"
 CURSOR_REMOTE_MAX_AGE_SECS=$((7 * 24 * 3600))
+CURSOR_REMOTE_MUX_PERSIST=20h
+```
+
+Self-test (TUI helpers + Spaces watcher mapping):
+
+```sh
+./cursor-cli-remote --spaces-self-test
+# or: python3 ./forge_tui.py --self-test
 ```
 
 Update:

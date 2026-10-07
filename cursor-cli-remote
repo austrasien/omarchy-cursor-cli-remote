@@ -44,10 +44,19 @@ REMOTE_DIR="${CURSOR_REMOTE_DIR:-$HOME/work}"
 AGENT="${CURSOR_REMOTE_AGENT:-$HOME/.local/bin/agent}"
 WINDOW_TITLE="${CURSOR_REMOTE_TITLE:-Cursor Forge}"
 MAX_AGE_SECS="${CURSOR_REMOTE_MAX_AGE_SECS:-$((7 * 24 * 3600))}"
+# Backup if the 04:00 timer misses (suspend). Daily hard cutoff remains 04:00.
+MUX_PERSIST="${CURSOR_REMOTE_MUX_PERSIST:-20h}"
 THEME_COLORS="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current/theme/colors.toml"
+LOG_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/cursor-cli-remote.log"
 SHORTCUTS="123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+MUX_REHOME_WARN=""
 
 export GHOSTTY_RESOURCES_DIR="${GHOSTTY_RESOURCES_DIR:-1}"
+
+flog() {
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG_FILE" 2>/dev/null || true
+}
 
 theme_color() {
   local key="$1" fallback="$2"
@@ -161,7 +170,20 @@ spaces_watch_start() {
 }
 
 spaces_self_test() {
-  local bin
+  local bin tui="" here found=0
+  here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+  for tui in "$here/forge_tui.py" \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/bin/forge_tui.py"
+  do
+    [[ -f $tui ]] || continue
+    found=1
+    python3 "$tui" --self-test || return 1
+    break
+  done
+  ((found)) || {
+    printf 'forge_tui.py missing\n' >&2
+    return 1
+  }
   bin=$(spaces_watch_bin) || {
     printf 'spaces-forge-watch missing\n' >&2
     return 1
@@ -447,377 +469,43 @@ header_sub() {
       sub+="  ·  ${count} ${noun}"
     fi
   fi
+  # Mux policy: reuse until 04:00 local (timer + Match expire); ControlPersist is backup.
+  if [[ "$count" != loading ]] && ssh_master_ok 2>/dev/null; then
+    sub+="  ·  mux → 04:00"
+  fi
+  if [[ -n "${MUX_REHOME_WARN:-}" ]]; then
+    sub+="  ·  ⚠ mux Foot"
+  fi
   if [[ -n "$extra" ]]; then
     sub+="  ·  ${extra}"
   fi
   printf '%s' "$sub"
 }
 
-MENU_PY='
-import fcntl, glob, os, select, struct, sys, termios, time, tty, unicodedata
+# Mauve TUI lives in forge_tui.py (installed next to this script).
+forge_tui_bin() {
+  local here cand
+  here=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+  for cand in \
+    "$here/forge_tui.py" \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/bin/forge_tui.py"
+  do
+    [[ -f $cand ]] && { printf '%s' "$cand"; return 0; }
+  done
+  return 1
+}
 
-SHORTCUTS = "123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-AZERTY_ROW = dict(zip("&é\"" + chr(39) + "(-è_çà", "1234567890"))
-PAD_X, PAD_Y = 2, 1
-MIN_INNER = 52
-
-def rgb(value, fallback):
-    value = (value or "").lstrip("#")
-    try:
-        return (int(value[0:2], 16), int(value[2:4], 16), int(value[4:6], 16))
-    except Exception:
-        return fallback
-
-ACCENT = rgb(os.environ.get("ACCENT"), (203, 166, 247))
-FG = rgb(os.environ.get("FG"), (190, 190, 190))
-MUTED = rgb(os.environ.get("MUTED"), (85, 85, 85))
-BG = rgb(os.environ.get("BG"), (18, 18, 18))
-TITLE = os.environ.get("TITLE", "Cursor Forge")
-SUB = os.environ.get("SUB", "forge  ·  persist")
-HINT = os.environ.get("HINT", "0–9 A…  →/⏎  ouvrir     ↑↓     ⌫  supprimer     esc")
-MODE = os.environ.get("MODE", "pick")
-AUTO_YUBI = os.environ.get("AUTO_YUBI", "1") != "0"
-BODY_LINES = [ln for ln in os.environ.get("BODY", "").split("\n") if ln]
-
-def yubikey_plugged():
-    for path in glob.glob("/sys/bus/usb/devices/*/idVendor"):
-        try:
-            with open(path, encoding="ascii") as fh:
-                if fh.read().strip().lower() == "1050":
-                    return True
-        except OSError:
-            continue
-    return False
-
-def dw(text):
-    n = 0
-    for ch in text:
-        n += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
-    return n
-
-def fit(text, width):
-    if dw(text) <= width:
-        return text
-    out = []
-    n = 0
-    for ch in text:
-        w = 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
-        if n + w + 1 > width:
-            break
-        out.append(ch)
-        n += w
-    return "".join(out) + "…"
-
-def pad(text, width):
-    text = fit(text, width)
-    return text + " " * (width - dw(text))
-
-def cell(text, fg, bg):
-    return "\033[38;2;%d;%d;%dm\033[48;2;%d;%d;%dm%s" % (
-        fg[0], fg[1], fg[2], bg[0], bg[1], bg[2], text
-    )
-
-rows_in = [ln.rstrip("\n") for ln in sys.stdin.read().splitlines() if ln] if MODE == "pick" else []
-labels, ids, keys = [], [], {}
-for row in rows_in:
-    if "\t" in row:
-        label, ident = row.split("\t", 1)
-    else:
-        label, ident = row, ""
-    labels.append(label)
-    ids.append(ident)
-    k = label[:1]
-    if ident == "[new]":
-        for nk in ("n", "N", "+"):
-            keys[nk] = ident
-        continue
-    if k in SHORTCUTS:
-        keys[k] = ident
-        keys[k.lower()] = ident
-if MODE == "pick" and not labels:
-    sys.exit(1)
-
-def shortcut_lookup(key):
-    key = AZERTY_ROW.get(key, key)
-    return keys.get(key)
-
-fd = os.open("/dev/tty", os.O_RDWR)
-ui = os.fdopen(os.dup(fd), "w", buffering=1)
-old = termios.tcgetattr(fd)
-
-def restore():
-    try:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
-        ui.write("\033[0m\033[?25h")
-        ui.flush()
-    except Exception:
-        pass
-
-def winsize():
-    try:
-        packed = fcntl.ioctl(fd, termios.TIOCGWINSZ, b"\0" * 8)
-        r, c = struct.unpack("HHHH", packed)[:2]
-        return max(int(r), 8), max(int(c), 24)
-    except Exception:
-        return 24, 80
-
-def drain():
-    termios.tcflush(fd, termios.TCIFLUSH)
-    while select.select([fd], [], [], 0)[0]:
-        if not os.read(fd, 4096):
-            break
-
-def quiet_drain(seconds=0.08):
-    end = time.monotonic() + seconds
-    while True:
-        timeout = end - time.monotonic()
-        if timeout <= 0:
-            break
-        if select.select([fd], [], [], timeout)[0]:
-            if not os.read(fd, 4096):
-                break
-            end = time.monotonic() + 0.02
-
-def read_key():
-    ch = os.read(fd, 1)
-    if not ch:
-        return "ignore"
-    if ch in (b"\r", b"\n"):
-        return "enter"
-    if ch in (b"\x7f", b"\x08"):
-        return "bspace"
-    if ch == b"\x03":
-        return "esc"
-    if ch != b"\x1b":
-        try:
-            return ch.decode("utf-8")
-        except UnicodeDecodeError:
-            return "ignore"
-    seq = bytearray(ch)
-    if select.select([fd], [], [], 0.05)[0]:
-        nxt = os.read(fd, 1)
-        seq += nxt
-        if nxt in (b"[", b"O"):
-            while select.select([fd], [], [], 0.05)[0]:
-                nxt = os.read(fd, 1)
-                seq += nxt
-                if nxt.isalpha() or nxt in b"~":
-                    break
-    if seq in (b"\x1b", b"\x1b\x1b"):
-        return "esc"
-    if seq in (b"\x1b[A", b"\x1bOA"):
-        return "up"
-    if seq in (b"\x1b[B", b"\x1bOB"):
-        return "down"
-    if seq in (b"\x1b[C", b"\x1bOC"):
-        return "right"
-    if seq in (b"\x1b[D", b"\x1bOD"):
-        return "left"
-    return "ignore"
-
-idx = 0
-scroll = 0
-
-def paint_box():
-    global scroll
-    term_r, term_c = winsize()
-    show_list = MODE == "pick"
-    show_body = MODE in ("wait", "pin")
-    show_hint = MODE in ("pick", "wait")
-    items = labels if show_list else []
-    extra = BODY_LINES if show_body else []
-    chrome = 2 + 2 * PAD_Y + 2
-    if show_list or MODE == "wait":
-        chrome += 3
-    elif MODE == "pin":
-        chrome += 1 + len(extra)
-    max_rows = max(1, term_r - chrome)
-    if show_list:
-        if idx < scroll:
-            scroll = idx
-        if idx >= scroll + max_rows:
-            scroll = idx - max_rows + 1
-        visible = items[scroll:scroll + max_rows]
-    else:
-        visible = extra
-
-    inner = MIN_INNER
-    inner = max(inner, dw(TITLE), dw(SUB))
-    if show_list or show_body:
-        if show_hint:
-            inner = max(inner, dw(HINT))
-        for lab in items:
-            inner = max(inner, dw("› " + lab))
-        for lab in extra:
-            inner = max(inner, dw(lab))
-    inner = min(inner, max(20, term_c - 2 - 2 * PAD_X))
-    box_w = inner + 2 + 2 * PAD_X
-    inner_lines = 2 + 2 * PAD_Y
-    if show_list:
-        inner_lines += 3 + len(visible)
-    elif MODE == "wait":
-        inner_lines += 3 + len(visible)
-    elif MODE == "pin":
-        inner_lines += 1 + len(extra)
-    box_h = inner_lines + 2
-    top = max(1, (term_r - box_h) // 2 + 1)
-    if MODE == "pin":
-        top = max(2, min(top, max(2, term_r // 6)))
-        top = min(top, max(2, term_r - box_h - 8))
-    left = max(1, (term_c - box_w) // 2 + 1)
-    bar = "─" * (box_w - 2)
-    blank = " " * inner
-
-    def put(row, text):
-        ui.write("\033[%d;%dH%s\033[0m" % (row, left, text))
-
-    def side(content, fg):
-        return (
-            cell("│", ACCENT, BG)
-            + cell(" " * PAD_X, FG, BG)
-            + cell(pad(content, inner), fg, BG)
-            + cell(" " * PAD_X, FG, BG)
-            + cell("│", ACCENT, BG)
-        )
-
-    ui.write("\033[0m\033[2J\033[H\033[?25l")
-    row = top
-    put(row, cell("╭" + bar + "╮", ACCENT, BG)); row += 1
-    for _ in range(PAD_Y):
-        put(row, side(blank, FG)); row += 1
-    put(row, side(TITLE, ACCENT)); row += 1
-    put(row, side(SUB, MUTED)); row += 1
-    if show_list:
-        put(row, side(blank, FG)); row += 1
-        put(row, side(HINT, MUTED)); row += 1
-        put(row, side(blank, FG)); row += 1
-        for i, lab in enumerate(visible):
-            real = scroll + i
-            if real == idx:
-                put(row, side("› " + lab, ACCENT))
-            else:
-                put(row, side("  " + lab, FG))
-            row += 1
-    elif MODE == "wait":
-        put(row, side(blank, FG)); row += 1
-        put(row, side(HINT, MUTED)); row += 1
-        put(row, side(blank, FG)); row += 1
-        for lab in extra:
-            put(row, side(lab, FG)); row += 1
-    elif MODE == "pin":
-        put(row, side(blank, FG)); row += 1
-        for lab in extra:
-            put(row, side(lab, FG)); row += 1
-    for _ in range(PAD_Y):
-        put(row, side(blank, FG)); row += 1
-    put(row, cell("╰" + bar + "╯", ACCENT, BG))
-    ui.flush()
-    return row, term_r
-
-hid_ignore_until = 0.0
-was_yubi = yubikey_plugged()
-
-def note_yubi():
-    global hid_ignore_until, was_yubi
-    now_yubi = yubikey_plugged()
-    if now_yubi != was_yubi:
-        hid_ignore_until = time.monotonic() + 0.6
-        drain()
-        was_yubi = now_yubi
-    return now_yubi
-
-def hid_quiet():
-    return time.monotonic() < hid_ignore_until
-
-try:
-    if MODE == "wait":
-        drain()
-        tty.setraw(fd)
-        try:
-            while True:
-                note_yubi()
-                if AUTO_YUBI and was_yubi:
-                    quiet_drain(0.45)
-                    restore()
-                    sys.exit(0)
-                paint_box()
-                r, _, _ = select.select([fd], [], [], 0.35)
-                if not r:
-                    continue
-                key = read_key()
-                if hid_quiet() or key == "ignore":
-                    continue
-                if key == "esc":
-                    restore()
-                    sys.exit(130)
-                if key in ("enter", "right"):
-                    restore()
-                    sys.exit(0)
-        finally:
-            restore()
-    if MODE == "pin":
-        bottom, term_r = paint_box()
-        prompt_row = min(term_r, bottom + 2)
-        ui.write("\033[0m\033[%d;1H\033[J\033[?25h" % prompt_row)
-        ui.flush()
-        sys.exit(0)
-    if MODE != "pick":
-        paint_box()
-        ui.write("\033[0m\033[?25h")
-        ui.flush()
-        sys.exit(0)
-    drain()
-    tty.setraw(fd)
-    idx = 1 if len(labels) > 1 else 0
-    paint_box()
-    drain()
-    quiet_drain()
-    while True:
-        note_yubi()
-        r, _, _ = select.select([fd], [], [], 0.2)
-        if not r:
-            continue
-        key = read_key()
-        if hid_quiet() or key == "ignore":
-            continue
-        if key == "esc":
-            restore()
-            sys.exit(130)
-        if key == "up":
-            idx = (idx - 1) % len(labels)
-            paint_box()
-            continue
-        if key == "down":
-            idx = (idx + 1) % len(labels)
-            paint_box()
-            continue
-        if key == "left":
-            continue
-        action = None
-        ident = None
-        hit = shortcut_lookup(key)
-        if hit is not None:
-            action, ident = "open", hit
-        elif key in ("enter", "right"):
-            action, ident = "open", ids[idx]
-        elif key == "bspace":
-            action, ident = "delete", ids[idx]
-        else:
-            continue
-        restore()
-        sys.stdout.write("%s\n%s\n" % (action, ident))
-        sys.stdout.flush()
-        sys.exit(0)
-finally:
-    if MODE == "pick":
-        restore()
-'
+run_tui() {
+  local mode="$1" bin
+  bin=$(forge_tui_bin) || die "forge_tui.py introuvable (relance ./install.sh)."
+  MODE="$mode" python3 "$bin" --mode "$mode"
+}
 
 draw_header() {
   restore_tty
   MODE=loading TITLE="$WINDOW_TITLE" SUB="$(header_sub "$@")" \
     ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
-    python3 -c "$MENU_PY" </dev/null >/dev/tty
+    run_tui loading </dev/null >/dev/tty
 }
 
 choose() {
@@ -826,12 +514,14 @@ choose() {
   MODE=pick TITLE="$WINDOW_TITLE" SUB="$sub" \
     HINT="n  nouvelle     1–9 A…  ouvrir     ↑↓     ⌫  supprimer     esc" \
     ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
-    python3 -c "$MENU_PY"
+    run_tui pick
 }
+
 
 YUBI_BODY=$'1. Branche la YubiKey 5C en USB-C (YK1 quotidien ou YK2).
 2. PIN FIDO2 si demandé — le même PIN sur les deux clés.
-3. Touche le pad or. SSH ouvre alors le tunnel vers forge.'
+3. Touche le pad or. SSH ouvre le tunnel (réutilisé jusqu'\''à 04:00).
+La clé OTP injecte Esc/Entrée : ignorés ici. Pour fermer sans clé : q puis q.'
 
 yubikey_present() {
   local f
@@ -839,7 +529,16 @@ yubikey_present() {
     [[ -f "$f" ]] || continue
     [[ "$(<"$f")" == "1050" ]] && return 0
   done
+  for f in /sys/bus/usb/devices/*/product; do
+    [[ -f "$f" ]] || continue
+    [[ "$(<"$f")" == *[Yy]ubi[Kk]ey* ]] && return 0
+  done
   return 1
+}
+
+wait_should_quit() {
+  local st="${1:-0}"
+  ((st == 130))
 }
 
 ssh_master_ok() {
@@ -849,14 +548,46 @@ ssh_master_ok() {
 # ControlMaster forks inside Foot's gtk-launch/uwsm scope. When the window
 # closes, systemd kills the mux and the next launch asks for the YubiKey
 # again. Move it onto a delegated user service (Delegate=yes is required
-# for AttachProcessesToUnit). The 04:00 ssh-forge-close.timer still drops it.
+# for AttachProcessesToUnit).
+#
+# Mux lifetime (explicit policy):
+#   1) Hard cutoff 04:00 local — ssh-forge-close.timer + Match expire script
+#   2) ControlPersist=${MUX_PERSIST} — safety net if the timer missed (suspend)
+# Closing Foot must NOT kill the mux (rehome_mux). Failure is logged + warned.
 MUX_UNIT="ssh-${REMOTE}-mux.service"
 
-drop_stale_master() {
-  ssh_master_ok && return 0
-  if [[ -n "${FORGE_CONTROL:-}" && -S "$FORGE_CONTROL" ]]; then
+# ssh -O check only means the local mux process exists. After suspend,
+# Tailscale blips, or forge reboot, the socket stays up while the tunnel
+# is dead — and ConnectTimeout often does not apply through ControlMaster.
+# External timeout + a cheap remote true is the real liveness check.
+ssh_master_alive() {
+  ssh_master_ok || return 1
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 6 ssh -o BatchMode=yes -o ConnectTimeout=5 \
+      -o ServerAliveInterval=2 -o ServerAliveCountMax=1 \
+      "$REMOTE" true >/dev/null 2>&1
+  else
+    SSH_ASKPASS_REQUIRE=never ssh -o BatchMode=yes -o ConnectTimeout=5 \
+      -o ServerAliveInterval=2 -o ServerAliveCountMax=1 \
+      "$REMOTE" true >/dev/null 2>&1
+  fi
+}
+
+kill_mux() {
+  flog "kill_mux remote=$REMOTE unit=$MUX_UNIT"
+  ssh -O exit "$REMOTE" >/dev/null 2>&1 || true
+  systemctl --user stop "$MUX_UNIT" >/dev/null 2>&1 || true
+  if [[ -n "${FORGE_CONTROL:-}" ]]; then
     rm -f "$FORGE_CONTROL"
   fi
+  MUX_REHOME_WARN=""
+}
+
+drop_stale_master() {
+  if ssh_master_ok; then
+    return 0
+  fi
+  kill_mux
   return 0
 }
 
@@ -930,52 +661,131 @@ raise SystemExit(1)
 }
 
 ensure_mux_unit() {
-  local unit="$1"
+  local unit="$1" out st=0
   systemctl --user is-active --quiet "$unit" && return 0
   systemctl --user reset-failed "$unit" 2>/dev/null || true
-  systemd-run --user --quiet --collect \
+  set +e
+  out=$(systemd-run --user --quiet --collect \
     --unit="$unit" \
     --property=Delegate=yes \
     --property=Slice=app.slice \
-    /usr/bin/sleep infinity >/dev/null 2>&1
+    /usr/bin/sleep infinity 2>&1)
+  st=$?
+  set -e
+  if ((st != 0)); then
+    flog "ensure_mux_unit fail unit=$unit st=$st out=$out"
+    return 1
+  fi
+  systemctl --user is-active --quiet "$unit"
+}
+
+mux_in_unit() {
+  local pid="$1" unit="$2"
+  [[ -r "/proc/${pid}/cgroup" ]] || return 1
+  grep -q "/${unit}$" "/proc/${pid}/cgroup" 2>/dev/null
 }
 
 rehome_mux() {
-  local sock pid unit="$MUX_UNIT"
+  local sock pid unit="$MUX_UNIT" out st=0 cg=""
   sock="${FORGE_CONTROL:-}"
-  [[ -n "$sock" && -S "$sock" ]] || return 0
-  command -v busctl >/dev/null 2>&1 || return 0
-  pid="$(mux_pid_for_socket "$sock")" || return 0
-  [[ -n "$pid" ]] || return 0
-  if grep -q "/${unit}$" "/proc/${pid}/cgroup" 2>/dev/null; then
+  if [[ -z "$sock" || ! -S "$sock" ]]; then
+    flog "rehome_mux skip: no control socket (${sock:-empty})"
     return 0
   fi
-  ensure_mux_unit "$unit" || return 0
-  busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
+  if ! command -v busctl >/dev/null 2>&1; then
+    MUX_REHOME_WARN="busctl absent"
+    flog "rehome_mux fail: busctl missing — mux stays in Foot cgroup"
+    return 1
+  fi
+  set +e
+  pid="$(mux_pid_for_socket "$sock")"
+  st=$?
+  set -e
+  if ((st != 0)) || [[ -z "$pid" ]]; then
+    MUX_REHOME_WARN="PID mux introuvable"
+    flog "rehome_mux fail: mux pid not found for $sock"
+    return 1
+  fi
+  if mux_in_unit "$pid" "$unit"; then
+    MUX_REHOME_WARN=""
+    flog "rehome_mux ok: already in $unit pid=$pid"
+    return 0
+  fi
+  if ! ensure_mux_unit "$unit"; then
+    MUX_REHOME_WARN="unit $unit KO"
+    flog "rehome_mux fail: ensure_mux_unit $unit"
+    return 1
+  fi
+  set +e
+  out=$(busctl --user call org.freedesktop.systemd1 /org/freedesktop/systemd1 \
     org.freedesktop.systemd1.Manager AttachProcessesToUnit \
-    ssau "$unit" / 1 "$pid" >/dev/null 2>&1 || true
+    ssau "$unit" / 1 "$pid" 2>&1)
+  st=$?
+  set -e
+  if ((st != 0)); then
+    MUX_REHOME_WARN="attach mux KO"
+    flog "rehome_mux fail: AttachProcessesToUnit st=$st pid=$pid out=$out"
+    return 1
+  fi
+  sleep 0.05
+  if ! mux_in_unit "$pid" "$unit"; then
+    cg="$(tr '\n' ' ' <"/proc/${pid}/cgroup" 2>/dev/null | head -c 240 || true)"
+    MUX_REHOME_WARN="mux encore dans Foot"
+    flog "rehome_mux fail: cgroup verify pid=$pid not in $unit cg=$cg"
+    return 1
+  fi
+  MUX_REHOME_WARN=""
+  flog "rehome_mux ok: pid=$pid -> $unit (survive Foot close; PIN again after 04:00)"
+  return 0
+}
+
+warn_mux_rehome() {
+  local detail="${MUX_REHOME_WARN:-rehome échoué}"
+  flog "warn_mux_rehome: $detail"
+  {
+    printf '\n'
+    if command -v gum >/dev/null; then
+      gum style --foreground "$ACCENT" --padding "0 1" \
+        "⚠ Mux SSH pas détaché de Foot (${detail})."
+      gum style --faint --foreground "$MUTED" \
+        "Fermer cette fenêtre redemandera la YubiKey. Log: $LOG_FILE"
+      gum style --faint --foreground "$MUTED" "Entrée pour continuer…"
+    else
+      printf 'Mux SSH pas détaché de Foot (%s).\nLog: %s\nEntrée…\n' \
+        "$detail" "$LOG_FILE"
+    fi
+  } >/dev/tty 2>/dev/null || true
+  read -r _ </dev/tty || true
 }
 
 draw_wait() {
   local sub="$1"
   local body="${2:-$YUBI_BODY}"
   local auto_yubi="${3:-1}"
-  local hint="Entrée  réessayer     esc  fermer"
+  local hint st
   if [[ "$auto_yubi" == 1 ]]; then
-    hint+="     reprise auto dès la clé"
+    hint="reprise auto dès la clé     q×2  fermer (pas Esc — OTP)"
+  else
+    hint="Entrée  réessayer     esc×2 (lent)  fermer"
   fi
   restore_tty
+  set +e
   AUTO_YUBI="$auto_yubi" MODE=wait TITLE="$WINDOW_TITLE" SUB="$sub" \
     HINT="$hint" \
     BODY="$body" \
     ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
-    python3 -c "$MENU_PY" </dev/null >/dev/tty
+    run_tui wait </dev/null >/dev/tty
+  st=$?
+  set -e
+  flog "draw_wait auto_yubi=$auto_yubi sub=$sub exit=$st"
+  return "$st"
 }
 
 PIN_BODY=$'1. Tape le PIN FIDO2, puis Entrée.
 2. Touche le pad or.'
 
-CONNECT_BODY=$'Ouverture du tunnel SSH vers forge…'
+CONNECT_BODY=$'Ouverture du tunnel SSH vers forge…
+Mux réutilisé jusqu'\''à 04:00 (pas de re-PIN le même jour si Foot ferme proprement).'
 
 TS_BODY=$'Tailscale est arrêté. Reconnexion au tailnet…'
 
@@ -1002,7 +812,7 @@ draw_status() {
   MODE=pin TITLE="$WINDOW_TITLE" SUB="$sub" \
     BODY="$body" \
     ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
-    python3 -c "$MENU_PY" </dev/null >/dev/tty
+    run_tui pin </dev/null >/dev/tty
 }
 
 draw_pin() {
@@ -1010,7 +820,7 @@ draw_pin() {
   MODE=pin TITLE="$WINDOW_TITLE" SUB="${REMOTE}  ·  PIN FIDO2" \
     BODY="$PIN_BODY" \
     ACCENT="$ACCENT" FG="$FG" MUTED="$MUTED" BG="$BG" \
-    python3 -c "$MENU_PY" </dev/null >/dev/tty
+    run_tui pin </dev/null >/dev/tty
   prep_tty_for_pin
 }
 
@@ -1023,7 +833,11 @@ open_master() {
   [[ -n "$FORGE_HOST" ]] || load_ssh_meta
   drop_stale_master
   mkdir -p "$(dirname "${FORGE_CONTROL:-$HOME/.ssh/sockets/x}")"
+  # Let OTP HID finish chattering before ssh reads the FIDO PIN.
+  flush_tty
+  sleep 0.4
   prep_tty_for_pin
+  flush_tty
   for ident in "${FORGE_IDENTS[@]}"; do
     [[ -r "$ident" ]] || continue
     set +e
@@ -1040,7 +854,7 @@ open_master() {
       -o User="$FORGE_USER" \
       -o ControlMaster=auto \
       -o ControlPath="${FORGE_CONTROL:-$HOME/.ssh/sockets/%C}" \
-      -o ControlPersist=yes \
+      -o ControlPersist="$MUX_PERSIST" \
       "$FORGE_HOST" true </dev/tty >/dev/tty 2>/dev/tty
     st=$?
     set +e
@@ -1067,9 +881,18 @@ open_master() {
 ensure_forge() {
   local wait_st=0 st=0 why
   drop_stale_master
-  if ssh_master_ok; then
-    rehome_mux
+  if ssh_master_alive; then
+    flog "ensure_forge: existing mux alive"
+    if ! rehome_mux; then
+      warn_mux_rehome
+    fi
     return 0
+  fi
+  # Local mux lied, or never existed: tear it down so the wait loop can
+  # show Tailscale / YubiKey / injoignable instead of hanging on attach.
+  if ssh_master_ok || [[ -n "${FORGE_CONTROL:-}" && -S "${FORGE_CONTROL:-}" ]]; then
+    flog "ensure_forge: stale/dead mux — kill and reauth"
+    kill_mux
   fi
   while true; do
     set +e
@@ -1081,7 +904,7 @@ ensure_forge() {
       draw_wait "${REMOTE}  ·  Tailscale login" "$TS_LOGIN_BODY" 0
       wait_st=$?
       set -e
-      ((wait_st == 130)) && exit 0
+      wait_should_quit "$wait_st" && exit 0
       continue
     fi
     if ((st != 0)); then
@@ -1089,7 +912,7 @@ ensure_forge() {
       draw_wait "${REMOTE}  ·  Tailscale down" "$TS_FAIL_BODY" 0
       wait_st=$?
       set -e
-      ((wait_st == 130)) && exit 0
+      wait_should_quit "$wait_st" && exit 0
       continue
     fi
     if ! yubikey_present; then
@@ -1097,21 +920,31 @@ ensure_forge() {
       draw_wait "${REMOTE}  ·  YubiKey absente"
       wait_st=$?
       set -e
-      ((wait_st == 130)) && exit 0
+      flog "ensure_forge yubi-wait exit=$wait_st present=$(yubikey_present && echo yes || echo no)"
+      if wait_should_quit "$wait_st"; then
+        flog "ensure_forge: user quit while waiting for YubiKey"
+        exit 0
+      fi
       yubikey_present || continue
-      sleep 1
+      # USB keyboard interface enumerates after idVendor; OTP keeps
+      # injecting Esc/Enter — drain before ssh reads the TTY.
+      sleep 2
+      flush_tty
+      sleep 0.5
+      flush_tty
     fi
-    draw_status "${REMOTE}  ·  connexion…"
     set +e
+    draw_status "${REMOTE}  ·  connexion…"
     forge_tcp_ok
     st=$?
     set -e
+    flog "ensure_forge tcp_ok st=$st why=${FORGE_TCP_WHY:-}"
     if ((st == 1)); then
       set +e
       draw_wait "${REMOTE}  ·  injoignable" "$UNREACH_BODY" 0
       wait_st=$?
       set -e
-      ((wait_st == 130)) && exit 0
+      wait_should_quit "$wait_st" && exit 0
       continue
     fi
     if ((st != 0)); then
@@ -1119,18 +952,22 @@ ensure_forge() {
       draw_wait "${REMOTE}  ·  refus SSH" "$(ssh_refuse_body "${FORGE_TCP_WHY:-refus}")" 0
       wait_st=$?
       set -e
-      ((wait_st == 130)) && exit 0
+      wait_should_quit "$wait_st" && exit 0
       continue
     fi
-    draw_pin
     set +e
+    draw_pin
     open_master
     st=$?
     set -e
     if ((st == 0)) || ssh_master_ok; then
-      rehome_mux
+      flog "ensure_forge: open_master ok st=$st"
+      if ! rehome_mux; then
+        warn_mux_rehome
+      fi
       return 0
     fi
+    flog "ensure_forge: open_master failed st=$st"
     why="PIN, touche, ou réseau"
     yubikey_present || why="YubiKey absente"
     restore_tty
@@ -1143,7 +980,7 @@ ensure_forge() {
     fi
     wait_st=$?
     set -e
-    ((wait_st == 130)) && exit 0
+    wait_should_quit "$wait_st" && exit 0
   done
 }
 
@@ -1198,14 +1035,25 @@ while true; do
 
   raw=""
   set +e
-  raw="$(SSH_ASKPASS_REQUIRE=never ssh -o BatchMode=yes -o ConnectTimeout=8 "$REMOTE" "$(fetch_remote_cmd "$need_prune")")"
+  if command -v timeout >/dev/null 2>&1; then
+    raw="$(timeout 20 env SSH_ASKPASS_REQUIRE=never ssh -o BatchMode=yes -o ConnectTimeout=8 \
+      -o ServerAliveInterval=2 -o ServerAliveCountMax=2 \
+      "$REMOTE" "$(fetch_remote_cmd "$need_prune")")"
+  else
+    raw="$(SSH_ASKPASS_REQUIRE=never ssh -o BatchMode=yes -o ConnectTimeout=8 \
+      -o ServerAliveInterval=2 -o ServerAliveCountMax=2 \
+      "$REMOTE" "$(fetch_remote_cmd "$need_prune")")"
+  fi
   ssh_status=$?
   set +e
   if ((ssh_status != 0)); then
-    if ssh_master_ok; then
-      die "agent persist injoignable sur forge (${AGENT})."
+    # Zombie mux / network drop: recover into ensure_forge wait UI.
+    if ! ssh_master_alive; then
+      kill_mux
+      continue
     fi
-    continue
+    # Mux really works; remote command failed (agent missing / broken).
+    die "agent persist injoignable sur forge (${AGENT})."
   fi
 
   pruned=0

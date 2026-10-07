@@ -15,7 +15,7 @@ usage() {
   cat <<'EOF'
 Usage: ./install.sh
 
-Copies cursor-cli-remote and spaces-forge-watch into
+Copies cursor-cli-remote, forge_tui.py, and spaces-forge-watch into
 ~/.config/omarchy/bin, keeps the cursor-forge-persist name as a
 symlink, installs a Super+Space desktop entry, writes
 cursor-cli-remote.env if missing, installs Spaces stamps on the
@@ -49,6 +49,7 @@ fi
 mkdir -p "$BIN_OMARCHY" "$BIN_LOCAL" "$APPS" "$HOOKS" "$(dirname "$CONFIG")"
 
 install -m 0755 "$ROOT/cursor-cli-remote" "$BIN_OMARCHY/cursor-cli-remote"
+install -m 0755 "$ROOT/forge_tui.py" "$BIN_OMARCHY/forge_tui.py"
 install -m 0755 "$ROOT/spaces-forge-watch" "$BIN_OMARCHY/spaces-forge-watch"
 install -m 0755 "$ROOT/hooks/spaces-forge-stamp.py" "$HOOKS/spaces-forge-stamp.py"
 ln -sfn "$BIN_OMARCHY/cursor-cli-remote" "$BIN_OMARCHY/cursor-forge-persist"
@@ -63,8 +64,12 @@ CURSOR_REMOTE_AGENT=$HOME/.local/bin/agent
 CURSOR_REMOTE_TITLE="Cursor Forge"
 CURSOR_REMOTE_ACCENT="#cba6f7"
 CURSOR_REMOTE_MAX_AGE_SECS=$((7 * 24 * 3600))
+CURSOR_REMOTE_MUX_PERSIST=20h
 EOF
   printf 'Wrote %s\n' "$CONFIG"
+elif ! grep -q '^CURSOR_REMOTE_MUX_PERSIST=' "$CONFIG" 2>/dev/null; then
+  printf 'CURSOR_REMOTE_MUX_PERSIST=20h\n' >>"$CONFIG"
+  printf 'Appended CURSOR_REMOTE_MUX_PERSIST to %s\n' "$CONFIG"
 fi
 
 if [[ ! -f "$FOOT_INI" ]]; then
@@ -106,13 +111,16 @@ if [[ -f "$CONFIG" ]]; then
   AGENT_PATH="${CURSOR_REMOTE_AGENT:-$HOME/.local/bin/agent}"
 fi
 
-"$BIN_OMARCHY/spaces-forge-watch" --self-test
+"$BIN_OMARCHY/cursor-cli-remote" --spaces-self-test
 if ! "$BIN_OMARCHY/spaces-forge-watch" --install-hooks --remote "$REMOTE_NAME" --agent "$AGENT_PATH"; then
   printf 'Spaces hooks on %s: skipped (SSH later, or next attach)\n' "$REMOTE_NAME"
 fi
 "$BIN_OMARCHY/spaces-forge-watch" --adopt --remote "$REMOTE_NAME" --agent "$AGENT_PATH"
 
 printf 'Installed %s\n' "$BIN_OMARCHY/cursor-cli-remote"
+printf 'TUI: %s\n' "$BIN_OMARCHY/forge_tui.py"
 printf 'Watch: %s\n' "$BIN_OMARCHY/spaces-forge-watch"
+printf 'Log: %s\n' "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/cursor-cli-remote.log"
 printf 'Desktop: %s/Cursor Forge CLI.desktop\n' "$APPS"
+printf 'Mux: reuse until 04:00 (ControlPersist backup 20h)\n'
 printf 'Super+Space → Cursor Forge CLI\n'
