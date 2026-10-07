@@ -880,12 +880,17 @@ open_master() {
 
 ensure_forge() {
   local wait_st=0 st=0 why
+  # YubiKey OTP enumerates as a USB keyboard and injects Ctrl+C. With
+  # set -e, a SIGINT during sleep/ssh aborts the whole launcher and Foot
+  # vanishes ~2s after plug — log showed wait exit=0 then silence.
+  trap '' INT QUIT
   drop_stale_master
   if ssh_master_alive; then
     flog "ensure_forge: existing mux alive"
     if ! rehome_mux; then
       warn_mux_rehome
     fi
+    trap - INT QUIT
     return 0
   fi
   # Local mux lied, or never existed: tear it down so the wait loop can
@@ -898,73 +903,63 @@ ensure_forge() {
     set +e
     ensure_tailscale
     st=$?
-    set -e
+    set +e
     if ((st == 2)); then
-      set +e
       draw_wait "${REMOTE}  ·  Tailscale login" "$TS_LOGIN_BODY" 0
       wait_st=$?
-      set -e
-      wait_should_quit "$wait_st" && exit 0
+      wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
       continue
     fi
     if ((st != 0)); then
-      set +e
       draw_wait "${REMOTE}  ·  Tailscale down" "$TS_FAIL_BODY" 0
       wait_st=$?
-      set -e
-      wait_should_quit "$wait_st" && exit 0
+      wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
       continue
     fi
     if ! yubikey_present; then
-      set +e
       draw_wait "${REMOTE}  ·  YubiKey absente"
       wait_st=$?
-      set -e
       flog "ensure_forge yubi-wait exit=$wait_st present=$(yubikey_present && echo yes || echo no)"
       if wait_should_quit "$wait_st"; then
         flog "ensure_forge: user quit while waiting for YubiKey"
+        trap - INT QUIT
         exit 0
       fi
       yubikey_present || continue
-      # USB keyboard interface enumerates after idVendor; OTP keeps
-      # injecting Esc/Enter — drain before ssh reads the TTY.
-      sleep 2
+      # OTP keeps injecting Ctrl+C/Esc/Enter after idVendor appears.
+      # Never bare-sleep under set -e — SIGINT would kill Foot here.
+      flog "ensure_forge: post-yubi drain (ignore INT)"
+      sleep 2 || true
       flush_tty
-      sleep 0.5
+      sleep 0.5 || true
       flush_tty
+      flog "ensure_forge: post-yubi drain done"
     fi
-    set +e
     draw_status "${REMOTE}  ·  connexion…"
     forge_tcp_ok
     st=$?
-    set -e
     flog "ensure_forge tcp_ok st=$st why=${FORGE_TCP_WHY:-}"
     if ((st == 1)); then
-      set +e
       draw_wait "${REMOTE}  ·  injoignable" "$UNREACH_BODY" 0
       wait_st=$?
-      set -e
-      wait_should_quit "$wait_st" && exit 0
+      wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
       continue
     fi
     if ((st != 0)); then
-      set +e
       draw_wait "${REMOTE}  ·  refus SSH" "$(ssh_refuse_body "${FORGE_TCP_WHY:-refus}")" 0
       wait_st=$?
-      set -e
-      wait_should_quit "$wait_st" && exit 0
+      wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
       continue
     fi
-    set +e
     draw_pin
     open_master
     st=$?
-    set -e
     if ((st == 0)) || ssh_master_ok; then
       flog "ensure_forge: open_master ok st=$st"
       if ! rehome_mux; then
         warn_mux_rehome
       fi
+      trap - INT QUIT
       return 0
     fi
     flog "ensure_forge: open_master failed st=$st"
@@ -972,16 +967,15 @@ ensure_forge() {
     yubikey_present || why="YubiKey absente"
     restore_tty
     clear || true
-    set +e
     if [[ "$why" == "YubiKey absente" ]]; then
       draw_wait "${REMOTE}  ·  ${why} — réessaie"
     else
       draw_wait "${REMOTE}  ·  ${why} — réessaie" "$YUBI_BODY" 0
     fi
     wait_st=$?
-    set -e
-    wait_should_quit "$wait_st" && exit 0
+    wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
   done
+  trap - INT QUIT
 }
 
 new_session() {
@@ -1024,9 +1018,14 @@ declare -A TASK_BY_ID=()
 need_prune=1
 prune_note=""
 
+# Last-resort breadcrumb if OTP SIGINT / set -e still kills us.
+trap 'flog "EXIT trap status=$? line=$LINENO"; trap - INT QUIT EXIT' EXIT
+
 while true; do
   clear || true
   ensure_forge
+  # Menu: allow Ctrl+C again (user may want it); OTP should be idle by then.
+  trap - INT QUIT
   if ((need_prune)); then
     draw_header loading "purge >7j"
   else
