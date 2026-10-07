@@ -113,6 +113,39 @@ load_ssh_meta() {
 
 load_ssh_meta
 
+# When OpenSSH PerSourcePenalties blocks the Tailscale IP ("Not allowed at
+# this time"), the LAN/direct address still speaks a real SSH banner.
+forge_lan_host() {
+  local peer="${1:-$REMOTE}"
+  command -v tailscale >/dev/null 2>&1 || return 1
+  python3 -c '
+import json, subprocess, sys
+peer = (sys.argv[1] or "").lower()
+try:
+    data = json.loads(subprocess.check_output(
+        ["tailscale", "status", "--json"], stderr=subprocess.DEVNULL, timeout=5
+    ))
+except Exception:
+    raise SystemExit(1)
+for p in (data.get("Peer") or {}).values():
+    host = (p.get("HostName") or "").lower()
+    dns = " ".join(p.get("DNSName") or "").lower() if isinstance(p.get("DNSName"), list) else str(p.get("DNSName") or "").lower()
+    name = (p.get("Name") or "").lower()
+    if peer not in (host, name) and peer not in dns:
+        continue
+    # CurAddr is "ip:port" of the direct path (often LAN).
+    cur = (p.get("CurAddr") or p.get("Relay") or "").strip()
+    if cur and ":" in cur and not cur.startswith("["):
+        ip = cur.rsplit(":", 1)[0]
+        if ip and not ip.startswith("100."):
+            print(ip)
+            raise SystemExit(0)
+    for ip in p.get("TailscaleIPs") or []:
+        pass  # keep looking for non-CGNAT direct
+raise SystemExit(1)
+' "$peer" 2>/dev/null
+}
+
 ssh_forge() {
   SSH_ASKPASS_REQUIRE=never ssh -o ConnectTimeout=8 "$REMOTE" "$@"
 }
@@ -796,9 +829,31 @@ Tailscale a été relancé si besoin. Entrée pour réessayer.'
 
 ssh_refuse_body() {
   local detail="${1:-refus SSH}"
-  printf '%s\n%s\n' \
-    "Le port 22 répond, mais ce n'est pas sshd :" \
-    "$detail"
+  case "$detail" in
+    *"Not allowed at this time"*)
+      printf '%s\n%s\n%s\n' \
+        "sshd a temporairement bloqué cette IP (OpenSSH PerSourcePenalties)." \
+        "Souvent après trop d'essais / probes sur le port 22 Tailscale." \
+        "Réessaie (fallback LAN auto) ou attends 1–2 min."
+      ;;
+    *)
+      printf '%s\n%s\n' \
+        "Le port 22 répond, mais ce n'est pas sshd :" \
+        "$detail"
+      ;;
+  esac
+}
+
+# If Tailscale IP is penalty-blocked, switch FORGE_HOST to LAN direct IP.
+forge_try_lan_fallback() {
+  local lan why="${FORGE_TCP_WHY:-}"
+  [[ "$why" == *"Not allowed at this time"* ]] || return 1
+  [[ "$FORGE_HOST" == 100.* ]] || return 1
+  lan=$(forge_lan_host "$REMOTE") || return 1
+  [[ -n "$lan" && "$lan" != "$FORGE_HOST" ]] || return 1
+  flog "ensure_forge: Tailscale $FORGE_HOST blocked — fallback LAN $lan"
+  FORGE_HOST="$lan"
+  return 0
 }
 
 draw_status() {
@@ -937,7 +992,13 @@ ensure_forge() {
     flog "ensure_forge: forge_tcp_ok…"
     forge_tcp_ok
     st=$?
-    flog "ensure_forge tcp_ok st=$st why=${FORGE_TCP_WHY:-}"
+    flog "ensure_forge tcp_ok st=$st why=${FORGE_TCP_WHY:-} host=$FORGE_HOST"
+    if ((st != 0)) && forge_try_lan_fallback; then
+      draw_status "${REMOTE}  ·  fallback LAN ${FORGE_HOST}…"
+      forge_tcp_ok
+      st=$?
+      flog "ensure_forge tcp_ok LAN st=$st why=${FORGE_TCP_WHY:-} host=$FORGE_HOST"
+    fi
     if ((st == 1)); then
       draw_wait "${REMOTE}  ·  injoignable" "$UNREACH_BODY" 0
       wait_st=$?
