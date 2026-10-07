@@ -256,7 +256,8 @@ sys.stdout.write(text or "empty")
 raise SystemExit(2)
 ' "$FORGE_HOST" "$FORGE_PORT" 5)"
   st=$?
-  set -e
+  # Do NOT set -e here: return 1/2 must reach the caller. Otherwise Foot
+  # dies right after YubiKey plug when forge TCP is down or non-SSH.
   FORGE_TCP_WHY="$out"
   return "$st"
 }
@@ -289,20 +290,19 @@ raise SystemExit(1)
 
 ensure_tailscale() {
   local st=0 i
+  set +e
   tailscale_state
   st=$?
   ((st == 0 || st == 3)) && return 0
   ((st == 2)) && return 2
   draw_status "${REMOTE}  ·  Tailscale…" "$TS_BODY"
-  set +e
   tailscale up >/dev/null 2>&1
-  set -e
   for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
     tailscale_state
     st=$?
     ((st == 0)) && return 0
     ((st == 2)) && return 2
-    sleep 0.5
+    sleep 0.5 || true
   done
   return 1
 }
@@ -829,18 +829,18 @@ draw_pin() {
 # a process substitution + set -e aborts the launcher right after PIN.
 open_master() {
   local ident st=1 i
+  set +e
   unset SSH_ASKPASS
   [[ -n "$FORGE_HOST" ]] || load_ssh_meta
   drop_stale_master
   mkdir -p "$(dirname "${FORGE_CONTROL:-$HOME/.ssh/sockets/x}")"
   # Let OTP HID finish chattering before ssh reads the FIDO PIN.
   flush_tty
-  sleep 0.4
+  sleep 0.4 || true
   prep_tty_for_pin
   flush_tty
   for ident in "${FORGE_IDENTS[@]}"; do
     [[ -r "$ident" ]] || continue
-    set +e
     SSH_ASKPASS_REQUIRE=never ssh -F /dev/null \
       -o ConnectTimeout=8 \
       -o ConnectionAttempts=1 \
@@ -857,14 +857,13 @@ open_master() {
       -o ControlPersist="$MUX_PERSIST" \
       "$FORGE_HOST" true </dev/tty >/dev/tty 2>/dev/tty
     st=$?
-    set +e
     if ((st == 0)); then
       for i in 1 2 3 4 5 6 7 8 9 10; do
         if ssh_master_ok; then
           restore_tty
           return 0
         fi
-        sleep 0.1
+        sleep 0.1 || true
       done
       restore_tty
       return 0
@@ -935,7 +934,11 @@ ensure_forge() {
       flush_tty
       flog "ensure_forge: post-yubi drain done"
     fi
+    # Keep set +e: forge_tcp_ok / open_master return non-zero on purpose.
+    set +e
+    flog "ensure_forge: draw_status connexion"
     draw_status "${REMOTE}  ·  connexion…"
+    flog "ensure_forge: forge_tcp_ok…"
     forge_tcp_ok
     st=$?
     flog "ensure_forge tcp_ok st=$st why=${FORGE_TCP_WHY:-}"
@@ -951,7 +954,9 @@ ensure_forge() {
       wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
       continue
     fi
+    flog "ensure_forge: draw_pin"
     draw_pin
+    flog "ensure_forge: open_master…"
     open_master
     st=$?
     if ((st == 0)) || ssh_master_ok; then
