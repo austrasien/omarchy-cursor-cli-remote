@@ -133,15 +133,28 @@ for p in (data.get("Peer") or {}).values():
     name = (p.get("Name") or "").lower()
     if peer not in (host, name) and peer not in dns:
         continue
-    # CurAddr is "ip:port" of the direct path (often LAN).
-    cur = (p.get("CurAddr") or p.get("Relay") or "").strip()
+    def is_lan(ip: str) -> bool:
+        # RFC1918 only — CurAddr can be a public WAN IP when away from home
+        # (e.g. 45.x), which is useless as an SSH "LAN fallback".
+        if ip.startswith("10."):
+            return True
+        if ip.startswith("192.168."):
+            return True
+        if ip.startswith("172."):
+            try:
+                second = int(ip.split(".")[1])
+            except (IndexError, ValueError):
+                return False
+            return 16 <= second <= 31
+        return False
+
+    # CurAddr is "ip:port" of the direct path (often home LAN).
+    cur = (p.get("CurAddr") or "").strip()
     if cur and ":" in cur and not cur.startswith("["):
         ip = cur.rsplit(":", 1)[0]
-        if ip and not ip.startswith("100."):
+        if is_lan(ip):
             print(ip)
             raise SystemExit(0)
-    for ip in p.get("TailscaleIPs") or []:
-        pass  # keep looking for non-CGNAT direct
 raise SystemExit(1)
 ' "$peer" 2>/dev/null
 }
@@ -597,16 +610,22 @@ MUX_UNIT="ssh-${REMOTE}-mux.service"
 # is dead — and ConnectTimeout often does not apply through ControlMaster.
 # External timeout + a cheap remote true is the real liveness check.
 ssh_master_alive() {
+  local tries="${1:-1}" i=0
   ssh_master_ok || return 1
-  if command -v timeout >/dev/null 2>&1; then
-    timeout 6 ssh -o BatchMode=yes -o ConnectTimeout=5 \
-      -o ServerAliveInterval=2 -o ServerAliveCountMax=1 \
-      "$REMOTE" true >/dev/null 2>&1
-  else
-    SSH_ASKPASS_REQUIRE=never ssh -o BatchMode=yes -o ConnectTimeout=5 \
-      -o ServerAliveInterval=2 -o ServerAliveCountMax=1 \
-      "$REMOTE" true >/dev/null 2>&1
-  fi
+  while ((i < tries)); do
+    if command -v timeout >/dev/null 2>&1; then
+      timeout 6 ssh -o BatchMode=yes -o ConnectTimeout=5 \
+        -o ServerAliveInterval=2 -o ServerAliveCountMax=1 \
+        "$REMOTE" true >/dev/null 2>&1 && return 0
+    else
+      SSH_ASKPASS_REQUIRE=never ssh -o BatchMode=yes -o ConnectTimeout=5 \
+        -o ServerAliveInterval=2 -o ServerAliveCountMax=1 \
+        "$REMOTE" true >/dev/null 2>&1 && return 0
+    fi
+    i=$((i + 1))
+    ((i < tries)) && sleep 1
+  done
+  return 1
 }
 
 kill_mux() {
@@ -622,6 +641,12 @@ kill_mux() {
 drop_stale_master() {
   if ssh_master_ok; then
     return 0
+  fi
+  # Mux process gone (network drop, sshd restart) but the sleep-infinity
+  # babysitter unit may still be up — clean without implying user error.
+  if [[ -n "${FORGE_CONTROL:-}" && -S "${FORGE_CONTROL:-}" ]] \
+    || systemctl --user is-active --quiet "$MUX_UNIT" 2>/dev/null; then
+    flog "drop_stale_master: mux process gone — clean socket/unit (re-PIN needed)"
   fi
   kill_mux
   return 0
@@ -906,6 +931,8 @@ open_master() {
       -o ControlMaster=auto \
       -o ControlPath="${FORGE_CONTROL:-$HOME/.ssh/sockets/%C}" \
       -o ControlPersist="$MUX_PERSIST" \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=4 \
       "$FORGE_HOST" true </dev/tty >/dev/tty 2>/dev/tty
     st=$?
     if ((st == 0)); then
@@ -935,7 +962,8 @@ ensure_forge() {
   # vanishes ~2s after plug — log showed wait exit=0 then silence.
   trap '' INT QUIT
   drop_stale_master
-  if ssh_master_alive; then
+  # Retry liveness: a single Tailscale blip must not burn the YubiKey session.
+  if ssh_master_alive 3; then
     flog "ensure_forge: existing mux alive"
     if ! rehome_mux; then
       warn_mux_rehome
@@ -943,10 +971,10 @@ ensure_forge() {
     trap - INT QUIT
     return 0
   fi
-  # Local mux lied, or never existed: tear it down so the wait loop can
-  # show Tailscale / YubiKey / injoignable instead of hanging on attach.
+  # Local mux process exists but remote is unreachable after retries —
+  # tear down so the wait loop can recover (may need YubiKey).
   if ssh_master_ok || [[ -n "${FORGE_CONTROL:-}" && -S "${FORGE_CONTROL:-}" ]]; then
-    flog "ensure_forge: stale/dead mux — kill and reauth"
+    flog "ensure_forge: mux present but remote dead after retries — kill and reauth"
     kill_mux
   fi
   while true; do
