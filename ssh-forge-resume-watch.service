@@ -1,0 +1,14 @@
+[Unit]
+Description=Silent forge SSH mux reconnect after laptop resume (disk key)
+PartOf=graphical-session.target
+After=graphical-session.target dbus.socket network-online.target
+Requires=dbus.socket
+
+[Service]
+Type=simple
+ExecStart=%h/.config/omarchy/bin/ssh-forge-resume-watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

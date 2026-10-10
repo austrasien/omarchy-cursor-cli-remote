@@ -1,0 +1,174 @@
+#!/usr/bin/env bash
+# After laptop resume: if the forge SSH ControlMaster died during sleep,
+# reconnect silently via KeePassXC→ssh-agent mux key (no PIN, no YubiKey, no Foot).
+set -euo pipefail
+
+BIN="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/bin/cursor-cli-remote"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/cursor-cli-remote.log"
+LOCK="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ssh-forge-resume.lock"
+LOAD_AGENT="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/bin/forge-mux-load-agent"
+
+flog() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '%s ssh-forge-resume: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null || true
+}
+
+mux_alive() {
+  ssh -O check forge >/dev/null 2>&1 || return 1
+  if command -v timeout >/dev/null 2>&1; then
+    timeout 6 ssh -o BatchMode=yes -o ConnectTimeout=5 forge true >/dev/null 2>&1
+  else
+    ssh -o BatchMode=yes -o ConnectTimeout=5 forge true >/dev/null 2>&1
+  fi
+}
+
+forge_host() {
+  ssh -G forge 2>/dev/null | awk 'tolower($1)=="hostname"{print $2; exit}'
+}
+
+forge_port() {
+  local p
+  p=$(ssh -G forge 2>/dev/null | awk 'tolower($1)=="port"{print $2; exit}')
+  [[ "$p" =~ ^[0-9]+$ ]] && printf '%s' "$p" || printf '22'
+}
+
+# Tailscale "Running" is not enough — wait until forge:22 speaks SSH.
+wait_network() {
+  local i host port
+  host=$(forge_host)
+  port=$(forge_port)
+  [[ -n "$host" ]] || host=forge
+  for i in $(seq 1 45); do
+    if command -v tailscale >/dev/null 2>&1; then
+      if ! tailscale status --json 2>/dev/null | grep -q '"BackendState":"Running"'; then
+        sleep 1
+        continue
+      fi
+    fi
+    if python3 -c '
+import socket, sys
+host, port = sys.argv[1], int(sys.argv[2])
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.settimeout(2)
+try:
+    s.connect((host, port))
+    b = s.recv(64)
+finally:
+    s.close()
+raise SystemExit(0 if b.startswith(b"SSH-") else 1)
+' "$host" "$port" 2>/dev/null; then
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+
+notify_fail() {
+  local msg="$1"
+  if command -v omarchy-notification-send >/dev/null 2>&1; then
+    omarchy-notification-send \
+      --app-name org.omarchy.agent.forge \
+      -i cursor-forge \
+      -u normal \
+      -t 20000 \
+      "Forge SSH" \
+      "$msg" || true
+  else
+    notify-send -u normal -t 20000 "Forge SSH" "$msg" 2>/dev/null || true
+  fi
+}
+
+silent_reconnect() {
+  exec 9>"$LOCK"
+  if ! flock -n 9; then
+    flog "reconnect already running — skip"
+    return 0
+  fi
+  if [[ ! -x "$BIN" ]]; then
+    flog "missing $BIN"
+    return 1
+  fi
+  # Agent often restarts on wake (socket activation). Reload mux key first.
+  if [[ -x "$LOAD_AGENT" ]]; then
+    "$LOAD_AGENT" >/dev/null 2>&1 || true
+  fi
+  flog "silent --resume-mux"
+  if "$BIN" --resume-mux; then
+    flog "reconnect ok"
+    return 0
+  fi
+  flog "reconnect failed"
+  notify_fail "Reconnect auto échoué — déverrouille KeePassXC (forge-mux), ou Forge CLI + YubiKey."
+  return 1
+}
+
+on_resume() {
+  flog "wake detected — checking mux"
+  sleep 2
+  if ! wait_network; then
+    flog "network/forge SSH not ready after wait (continuing anyway)"
+  else
+    flog "network/forge SSH ready"
+  fi
+  if mux_alive; then
+    flog "mux still alive after resume"
+    return 0
+  fi
+  flog "mux dead after resume — BatchMode reconnect"
+  silent_reconnect || true
+}
+
+consume_sleep_events() {
+  local line waking=0
+  while IFS= read -r line; do
+    # PrepareForSleep(true) = going to sleep; false = resumed.
+    if [[ $line == *"boolean true"* ]]; then
+      flog "prepare-for-sleep — mux will likely die"
+      waking=0
+    elif [[ $line == *"boolean false"* ]]; then
+      # Debounce: dbus can double-fire; run repair once.
+      if ((waking == 0)); then
+        waking=1
+        on_resume &
+      fi
+    fi
+  done
+}
+
+monitor_sleep_events() {
+  local monitor_fd monitor_pid
+  coproc SLEEP_EVENTS {
+    exec dbus-monitor --system \
+      "type='signal',sender='org.freedesktop.login1',interface='org.freedesktop.login1.Manager',member='PrepareForSleep'"
+  }
+  monitor_fd=${SLEEP_EVENTS[0]}
+  monitor_pid=$SLEEP_EVENTS_PID
+  trap 'kill "$monitor_pid" 2>/dev/null || true; wait "$monitor_pid" 2>/dev/null || true' EXIT
+  flog "watching PrepareForSleep (silent mux-key reconnect)"
+  consume_sleep_events <&"$monitor_fd"
+}
+
+case ${1:-} in
+  --reconnect)
+    silent_reconnect
+    exit $?
+    ;;
+  --check)
+    mux_alive && echo alive || echo dead
+    exit 0
+    ;;
+  -h | --help)
+    cat <<'EOF'
+Usage: ssh-forge-resume-watch [--reconnect | --check]
+
+Watches logind PrepareForSleep. On resume, if the forge SSH mux died,
+reconnects via KeePassXC SSH Agent (BatchMode) — no PIN, no YubiKey,
+no terminal. Sleep/lock OK while KeePass stays unlocked; after reboot,
+unlock KeePass once. Bootstrap: cursor-cli-remote --setup-mux-key.
+EOF
+    exit 0
+    ;;
+esac
+
+monitor_sleep_events

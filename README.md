@@ -55,13 +55,28 @@ While a session is attached, `spaces-forge-watch` reports Cursor status to the [
 
 If the SSH key is FIDO (`ed25519-sk`) and the YubiKey is unplugged, the mauve box stays open: plug USB-C, PIN if asked, touch the gold pad. The launcher retries as soon as vendor `1050` appears; Esc closes. Each `IdentityFile` is tried on its own so the unplugged key does not dump `device not found` over the TUI. PIN / touch prompts stay below the mauve box.
 
-### SSH mux lifetime
+### SSH mux lifetime (aligned with KeePassXC)
 
-| Layer | Role |
+FIDO ControlMaster sessions die when the laptop sleeps. A naked disk key would survive reboot too — too wide. KeePassXC’s built-in **SSH Agent** tab talks to gpg/GCR on this machine and can kill KeePass on unlock — prefer a **Trigger** instead. Defense in depth:
+
+- OpenSSH `ssh-agent.socket` holds `forge-mux` in memory for the session
+- KeePass **Trigger** on “Unlocked database” runs `forge-mux-load-agent` (`ssh-add`)
+- `ssh-agent.service.d/forge-mux.conf` reloads the key when the agent (re)starts (wake / socket activation)
+- Launcher + `--resume-mux` call `ensure_mux_in_agent` before BatchMode (no wasted 8s pubkey attempt on an empty agent)
+- Post-sleep: wait for forge:22 SSH banner (not only Tailscale `Running`) before declaring failure
+- Private key file remains on disk (0600) until you shred after embedding in KeePass
+
+| When | Mux reconnect |
 | :--- | :--- |
-| **04:00 local** | Hard cutoff — `ssh-forge-close.timer` + `Match host forge exec ssh-forge-expire.sh` |
-| **`ControlPersist` (default `20h`)** | Safety net if the laptop was suspended over 04:00 |
-| **`rehome_mux`** | Moves the mux PID into `ssh-<host>-mux.service` so closing Foot does **not** demand the YubiKey again the same day |
+| **Sleep / screen lock** | Silent (`ssh-forge-resume-watch` → `--resume-mux`) |
+| **Agent restart mid-session** | `ExecStartPost` → `forge-mux-load-agent` |
+| **Reboot / new session** | Unlock KeePass once → trigger loads the key into the agent |
+| **04:00** | Live ControlMaster closed; agent can open a new one without YubiKey |
+
+```sh
+cursor-cli-remote --setup-mux-key   # agent + pubkey on forge (YubiKey once)
+# KeePass → Database settings → Triggers → unlock → forge-mux-load-agent
+```
 
 If rehome fails, the TUI warns and logs to `~/.local/state/omarchy/cursor-cli-remote.log` (`⚠ mux Foot` in the subtitle). Override persist with `CURSOR_REMOTE_MUX_PERSIST` in the env file.
 
@@ -87,6 +102,7 @@ CURSOR_REMOTE_TITLE="Cursor Forge"
 CURSOR_REMOTE_ACCENT="#cba6f7"
 CURSOR_REMOTE_MAX_AGE_SECS=$((7 * 24 * 3600))
 CURSOR_REMOTE_MUX_PERSIST=20h
+CURSOR_REMOTE_MUX_KEY="$HOME/.ssh/id_ed25519_forge_mux"  # .pub on disk; private in KeePass
 ```
 
 Self-test (TUI helpers + Spaces watcher mapping):

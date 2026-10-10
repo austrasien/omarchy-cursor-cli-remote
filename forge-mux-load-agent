@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Load forge-mux into OpenSSH ssh-agent (session memory).
+# Intended as a KeePassXC Trigger on database unlock — not KeePass SSH Agent
+# (that path hits gpg-agent/GCR and can kill KeePassXC on this machine).
+set -euo pipefail
+
+KEY="${CURSOR_REMOTE_MUX_KEY:-$HOME/.ssh/id_ed25519_forge_mux}"
+SOCK="${CURSOR_REMOTE_SSH_AUTH_SOCK:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ssh-agent.socket}"
+LOG="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/cursor-cli-remote.log"
+
+flog() {
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+  printf '%s forge-mux-load-agent: %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >>"$LOG" 2>/dev/null || true
+}
+
+if [[ ! -r "$KEY" ]]; then
+  flog "missing private key $KEY"
+  exit 1
+fi
+# Prefer a live agent (not only the socket listener). Never block on
+# systemctl — a concurrent restart/start can hang forever on the user bus.
+if ! systemctl --user is-active --quiet ssh-agent.service 2>/dev/null; then
+  systemctl --user start --no-block ssh-agent.service 2>/dev/null \
+    || systemctl --user start --no-block ssh-agent.socket 2>/dev/null \
+    || true
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
+    systemctl --user is-active --quiet ssh-agent.service 2>/dev/null && break
+    [[ -S "$SOCK" ]] && break
+    sleep 0.1 || true
+  done
+fi
+if [[ ! -S "$SOCK" ]]; then
+  flog "no ssh-agent socket at $SOCK"
+  exit 1
+fi
+
+export SSH_AUTH_SOCK="$SOCK"
+if SSH_AUTH_SOCK="$SOCK" ssh-add -l 2>/dev/null | grep -qF "forge-mux"; then
+  flog "already in agent"
+  exit 0
+fi
+# Empty passphrase key — BatchMode-friendly; no pinentry.
+if SSH_ASKPASS_REQUIRE=never SSH_AUTH_SOCK="$SOCK" ssh-add "$KEY" </dev/null 2>/dev/null; then
+  flog "loaded $KEY into $SOCK"
+  exit 0
+fi
+flog "ssh-add failed"
+exit 1

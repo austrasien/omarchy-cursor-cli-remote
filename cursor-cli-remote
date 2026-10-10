@@ -51,6 +51,10 @@ WINDOW_TITLE="${CURSOR_REMOTE_TITLE:-Cursor Forge}"
 MAX_AGE_SECS="${CURSOR_REMOTE_MAX_AGE_SECS:-$((7 * 24 * 3600))}"
 # Backup if the 04:00 timer misses (suspend). Daily hard cutoff remains 04:00.
 MUX_PERSIST="${CURSOR_REMOTE_MUX_PERSIST:-20h}"
+# Mux ControlMaster identity (pubkey on disk; private key lives in KeePassXC → ssh-agent).
+# Lifetime ≈ KeePass unlock: sleep/lock OK; reboot → unlock KeePass once.
+MUX_KEY="${CURSOR_REMOTE_MUX_KEY:-$HOME/.ssh/id_ed25519_forge_mux}"
+MUX_PUB="${MUX_KEY}.pub"
 THEME_COLORS="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/current/theme/colors.toml"
 LOG_FILE="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/cursor-cli-remote.log"
 SHORTCUTS="123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -279,7 +283,7 @@ prep_tty_for_pin() {
 FORGE_TCP_WHY=""
 
 forge_tcp_ok() {
-  local out st=0
+  local out st=0 timeout="${1:-5}"
   [[ -n "$FORGE_HOST" ]] || load_ssh_meta
   FORGE_TCP_WHY=""
   set +e
@@ -305,12 +309,44 @@ if banner.startswith(b"SSH-"):
     raise SystemExit(0)
 sys.stdout.write(text or "empty")
 raise SystemExit(2)
-' "$FORGE_HOST" "$FORGE_PORT" 5)"
+' "$FORGE_HOST" "$FORGE_PORT" "$timeout")"
   st=$?
   # Do NOT set -e here: return 1/2 must reach the caller. Otherwise Foot
   # dies right after YubiKey plug when forge TCP is down or non-SSH.
   FORGE_TCP_WHY="$out"
   return "$st"
+}
+
+# After sleep, Tailscale BackendState=Running ≠ forge:22 ready. Retry before
+# showing "injoignable" / failing silent resume.
+wait_forge_tcp() {
+  local budget="${1:-30}" started now st=1 attempt=0
+  [[ -n "$FORGE_HOST" ]] || load_ssh_meta
+  started=$(date +%s)
+  set +e
+  while true; do
+    attempt=$((attempt + 1))
+    forge_tcp_ok 3
+    st=$?
+    if ((st == 0)); then
+      flog "wait_forge_tcp ok attempt=$attempt host=$FORGE_HOST"
+      return 0
+    fi
+    if ((st != 0)) && forge_try_lan_fallback; then
+      forge_tcp_ok 3
+      st=$?
+      if ((st == 0)); then
+        flog "wait_forge_tcp ok LAN attempt=$attempt host=$FORGE_HOST"
+        return 0
+      fi
+    fi
+    now=$(date +%s)
+    if ((now - started >= budget)); then
+      flog "wait_forge_tcp timeout budget=${budget}s st=$st why=${FORGE_TCP_WHY:-} host=$FORGE_HOST"
+      return "$st"
+    fi
+    sleep 1 || true
+  done
 }
 
 # 0 running, 1 stopped/starting, 2 needs login, 3 tailscale missing (treat as ok).
@@ -646,7 +682,7 @@ drop_stale_master() {
   # babysitter unit may still be up — clean without implying user error.
   if [[ -n "${FORGE_CONTROL:-}" && -S "${FORGE_CONTROL:-}" ]] \
     || systemctl --user is-active --quiet "$MUX_UNIT" 2>/dev/null; then
-    flog "drop_stale_master: mux process gone — clean socket/unit (re-PIN needed)"
+    flog "drop_stale_master: mux process gone — clean socket/unit"
   fi
   kill_mux
   return 0
@@ -725,6 +761,17 @@ ensure_mux_unit() {
   local unit="$1" out st=0
   systemctl --user is-active --quiet "$unit" && return 0
   systemctl --user reset-failed "$unit" 2>/dev/null || true
+  # Race / leftover transient: unit fragment exists but is inactive → start it
+  # instead of failing systemd-run with "already loaded or has a fragment file".
+  if systemctl --user cat "$unit" >/dev/null 2>&1; then
+    if systemctl --user start "$unit" >/dev/null 2>&1 \
+      && systemctl --user is-active --quiet "$unit"; then
+      flog "ensure_mux_unit: started existing $unit"
+      return 0
+    fi
+    systemctl --user stop "$unit" >/dev/null 2>&1 || true
+    systemctl --user reset-failed "$unit" 2>/dev/null || true
+  fi
   out=$(systemd-run --user --quiet --collect \
     --unit="$unit" \
     --property=Delegate=yes \
@@ -732,6 +779,16 @@ ensure_mux_unit() {
     /usr/bin/sleep infinity 2>&1)
   st=$?
   if ((st != 0)); then
+    # Parallel resume + launcher: peer may have won the create race.
+    if systemctl --user is-active --quiet "$unit"; then
+      flog "ensure_mux_unit: race won by peer — $unit active"
+      return 0
+    fi
+    if systemctl --user start "$unit" >/dev/null 2>&1 \
+      && systemctl --user is-active --quiet "$unit"; then
+      flog "ensure_mux_unit: start after systemd-run fail — $unit"
+      return 0
+    fi
     flog "ensure_mux_unit fail unit=$unit st=$st out=$out"
     return 1
   fi
@@ -852,6 +909,10 @@ Lance tailscale login, puis Entrée ici.'
 UNREACH_BODY=$'TCP vers forge a échoué — le PIN FIDO n'\''est pas encore demandé.
 Tailscale a été relancé si besoin. Entrée pour réessayer.'
 
+KEEPASS_BODY=$'Clé mux absente de l'\''agent SSH.
+Déverrouille KeePassXC (trigger → forge-mux-load-agent).
+Lock / veille: OK. Après reboot: unlock KeePass une fois.'
+
 ssh_refuse_body() {
   local detail="${1:-refus SSH}"
   case "$detail" in
@@ -900,6 +961,131 @@ draw_pin() {
   prep_tty_for_pin
 }
 
+# Prefer OpenSSH ssh-agent (KeePassXC); avoid gpg-agent — it prompts GCR and can kill KeePass.
+mux_ssh_auth_sock() {
+  local s
+  for s in \
+    "${CURSOR_REMOTE_SSH_AUTH_SOCK:-}" \
+    "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ssh-agent.socket" \
+    "${SSH_AUTH_SOCK:-}" \
+    "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/keyring/ssh" \
+    "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/gnupg/S.gpg-agent.ssh"
+  do
+    [[ -n "$s" && -S "$s" ]] || continue
+    # Skip gpg-agent unless explicitly forced — pinentry/GCR breaks KeePass unlock.
+    if [[ "$s" == *'/gnupg/S.gpg-agent.ssh' && -z "${CURSOR_REMOTE_SSH_AUTH_SOCK:-}" ]]; then
+      continue
+    fi
+    printf '%s' "$s"
+    return 0
+  done
+  return 1
+}
+
+mux_agent_has_key() {
+  local sock line
+  sock=$(mux_ssh_auth_sock) || return 1
+  [[ -r "$MUX_PUB" ]] || return 1
+  line=$(awk '{print $1" "$2}' "$MUX_PUB")
+  [[ -n "$line" ]] || return 1
+  SSH_AUTH_SOCK="$sock" ssh-add -L 2>/dev/null | grep -qF "$line"
+}
+
+# KeePass unlock / agent restart can leave the agent empty. Prefer
+# forge-mux-load-agent (disk key → OpenSSH agent) before wasting an SSH round-trip.
+ensure_mux_in_agent() {
+  local load_bin sock
+  mux_agent_has_key && return 0
+  load_bin="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/bin/forge-mux-load-agent"
+  [[ -x $load_bin ]] || load_bin="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/forge-mux-load-agent"
+  if [[ -x $load_bin ]]; then
+    "$load_bin" >/dev/null 2>&1 || true
+  fi
+  if mux_agent_has_key; then
+    flog "ensure_mux_in_agent: loaded via forge-mux-load-agent"
+    return 0
+  fi
+  # Last resort if the helper is missing but the private key is still on disk.
+  if [[ -r "$MUX_KEY" ]] && sock=$(mux_ssh_auth_sock); then
+    systemctl --user is-active --quiet ssh-agent.service 2>/dev/null \
+      || systemctl --user start --no-block ssh-agent.service 2>/dev/null \
+      || true
+    if SSH_ASKPASS_REQUIRE=never SSH_AUTH_SOCK="$sock" ssh-add "$MUX_KEY" </dev/null 2>/dev/null \
+      && mux_agent_has_key; then
+      flog "ensure_mux_in_agent: ssh-add fallback"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+# KeePassXC → ssh-agent (no touch). Legacy: passphrase-less file still on disk.
+open_master_batch() {
+  local st=1 i sock
+  set +e
+  unset SSH_ASKPASS
+  [[ -n "$FORGE_HOST" ]] || load_ssh_meta
+  mkdir -p "$(dirname "${FORGE_CONTROL:-$HOME/.ssh/sockets/x}")"
+  ensure_mux_in_agent || true
+
+  if sock=$(mux_ssh_auth_sock) && [[ -r "$MUX_PUB" ]] && mux_agent_has_key; then
+    SSH_AUTH_SOCK="$sock" SSH_ASKPASS_REQUIRE=never ssh -F /dev/null \
+      -o ConnectTimeout=8 \
+      -o ConnectionAttempts=1 \
+      -o BatchMode=yes \
+      -o PreferredAuthentications=publickey \
+      -o IdentitiesOnly=yes \
+      -o IdentityAgent="$sock" \
+      -o IdentityFile="$MUX_PUB" \
+      -o HostName="$FORGE_HOST" \
+      -o User="$FORGE_USER" \
+      -o ControlMaster=auto \
+      -o ControlPath="${FORGE_CONTROL:-$HOME/.ssh/sockets/%C}" \
+      -o ControlPersist="$MUX_PERSIST" \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=4 \
+      "$FORGE_HOST" true >/dev/null 2>&1
+    st=$?
+    if ((st == 0)) || ssh_master_ok; then
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        ssh_master_ok && return 0
+        sleep 0.1 || true
+      done
+      return 0
+    fi
+  fi
+
+  # Migration only: naked private key still on disk (should be shredded after KeePass import).
+  if [[ -r "$MUX_KEY" && ! -d "$MUX_KEY" ]]; then
+    flog "open_master_batch: legacy disk private key (import into KeePass then shred)"
+    SSH_ASKPASS_REQUIRE=never ssh -F /dev/null \
+      -o ConnectTimeout=8 \
+      -o ConnectionAttempts=1 \
+      -o BatchMode=yes \
+      -o PreferredAuthentications=publickey \
+      -o IdentitiesOnly=yes \
+      -o IdentityAgent=none \
+      -o IdentityFile="$MUX_KEY" \
+      -o HostName="$FORGE_HOST" \
+      -o User="$FORGE_USER" \
+      -o ControlMaster=auto \
+      -o ControlPath="${FORGE_CONTROL:-$HOME/.ssh/sockets/%C}" \
+      -o ControlPersist="$MUX_PERSIST" \
+      -o ServerAliveInterval=30 \
+      -o ServerAliveCountMax=4 \
+      "$FORGE_HOST" true >/dev/null 2>&1
+    st=$?
+    if ((st == 0)) || ssh_master_ok; then
+      for i in 1 2 3 4 5 6 7 8 9 10; do
+        ssh_master_ok && return 0
+        sleep 0.1 || true
+      done
+      return 0
+    fi
+  fi
+  return 1
+}
+
 # One IdentityFile per attempt. Putting both in ssh_config makes OpenSSH
 # print "device not found" for the unplugged key. Do not pipe ssh stderr:
 # a process substitution + set -e aborts the launcher right after PIN.
@@ -910,6 +1096,15 @@ open_master() {
   [[ -n "$FORGE_HOST" ]] || load_ssh_meta
   drop_stale_master
   mkdir -p "$(dirname "${FORGE_CONTROL:-$HOME/.ssh/sockets/x}")"
+  # KeePass agent (or legacy disk key) before FIDO.
+  if [[ -r "$MUX_PUB" ]] || [[ -r "$MUX_KEY" ]]; then
+    flog "open_master: try mux via agent/legacy"
+    if open_master_batch; then
+      flog "open_master: mux ok"
+      return 0
+    fi
+    flog "open_master: mux failed — falling back to YubiKey"
+  fi
   # Let OTP HID finish chattering before ssh reads the FIDO PIN.
   flush_tty
   sleep 0.4 || true
@@ -917,6 +1112,7 @@ open_master() {
   flush_tty
   for ident in "${FORGE_IDENTS[@]}"; do
     [[ -r "$ident" ]] || continue
+    [[ "$ident" == "$MUX_KEY" || "$ident" == "$MUX_PUB" ]] && continue
     SSH_ASKPASS_REQUIRE=never ssh -F /dev/null \
       -o ConnectTimeout=8 \
       -o ConnectionAttempts=1 \
@@ -955,6 +1151,251 @@ open_master() {
   return "$st"
 }
 
+mux_pubkey_line() {
+  local pub
+  [[ -r "$MUX_PUB" ]] || return 1
+  pub=$(cat "$MUX_PUB")
+  # Restrict to Tailscale CGNAT + common LAN ranges (laptop ↔ forge).
+  printf 'from="100.64.0.0/10,192.168.0.0/16,10.0.0.0/8" %s' "$pub"
+}
+
+# Ensure pubkey exists. Private key is only created as staging for KeePass import.
+ensure_mux_pubkey() {
+  mkdir -p "$HOME/.ssh"
+  chmod 700 "$HOME/.ssh" 2>/dev/null || true
+  if [[ -r "$MUX_PUB" ]]; then
+    return 0
+  fi
+  if [[ -r "$MUX_KEY" ]]; then
+    ssh-keygen -y -f "$MUX_KEY" >"$MUX_PUB"
+    chmod 644 "$MUX_PUB" 2>/dev/null || true
+    return 0
+  fi
+  return 1
+}
+
+# Staging keypair for --setup-mux-key (shred private after KeePass import).
+generate_mux_keypair_staging() {
+  ensure_mux_pubkey && [[ -r "$MUX_KEY" ]] && return 0
+  if [[ -r "$MUX_PUB" && ! -r "$MUX_KEY" ]]; then
+    printf 'Pubkey %s exists but private key is gone (already in KeePass?).\n' "$MUX_PUB"
+    return 0
+  fi
+  ssh-keygen -t ed25519 -N "" -C "forge-mux@$(hostname -s 2>/dev/null || echo omarchy)" \
+    -f "$MUX_KEY" >/dev/null
+  chmod 600 "$MUX_KEY"
+  chmod 644 "$MUX_PUB" 2>/dev/null || true
+  flog "generate_mux_keypair_staging: created $MUX_KEY (import into KeePass then shred)"
+}
+
+enable_keepass_ssh_agent() {
+  local ini="${XDG_CONFIG_HOME:-$HOME/.config}/keepassxc/keepassxc.ini"
+  local sock
+  sock=$(mux_ssh_auth_sock) || sock="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ssh-agent.socket"
+  mkdir -p "$(dirname "$ini")"
+  python3 - "$ini" "$sock" <<'PY'
+import sys
+from pathlib import Path
+ini, sock = Path(sys.argv[1]), sys.argv[2]
+text = ini.read_text() if ini.is_file() else ""
+lines = text.splitlines()
+out = []
+i = 0
+found = False
+while i < len(lines):
+    line = lines[i]
+    if line.strip() == "[SSHAgent]":
+        found = True
+        out.append("[SSHAgent]")
+        i += 1
+        keys = {"Enabled": "true", "UseOpenSSH": "true", "AuthSockOverride": sock}
+        seen = set()
+        while i < len(lines) and not lines[i].startswith("["):
+            raw = lines[i]
+            if "=" in raw and not raw.strip().startswith("#"):
+                k = raw.split("=", 1)[0].strip()
+                if k in keys:
+                    out.append(f"{k}={keys[k]}")
+                    seen.add(k)
+                    i += 1
+                    continue
+            out.append(raw)
+            i += 1
+        for k, v in keys.items():
+            if k not in seen:
+                out.append(f"{k}={v}")
+        continue
+    out.append(line)
+    i += 1
+if not found:
+    if out and out[-1] != "":
+        out.append("")
+    out.extend(["[SSHAgent]", "Enabled=true", "UseOpenSSH=true", f"AuthSockOverride={sock}"])
+ini.write_text("\n".join(out) + "\n")
+print(f"KeePassXC SSH Agent → {sock}")
+PY
+}
+
+shred_mux_private() {
+  [[ -f "$MUX_KEY" ]] || {
+    printf 'No private key at %s\n' "$MUX_KEY"
+    return 0
+  }
+  if command -v shred >/dev/null 2>&1; then
+    shred -u "$MUX_KEY" 2>/dev/null || rm -f "$MUX_KEY"
+  else
+    rm -f "$MUX_KEY"
+  fi
+  flog "shred_mux_private: removed $MUX_KEY"
+  printf 'Private key removed from disk. Pubkey kept: %s\n' "$MUX_PUB"
+}
+
+# Append mux pubkey on forge via an already-open ControlMaster (no re-auth).
+push_mux_pubkey_remote() {
+  local line b64 marker st=0
+  marker="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/forge-mux-pubkey.ok"
+  ensure_mux_pubkey || return 1
+  line=$(mux_pubkey_line) || return 1
+  b64=$(printf '%s' "$line" | base64 -w0 2>/dev/null || printf '%s' "$line" | base64)
+  ssh_forge "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; line=\$(printf '%s' '$b64' | base64 -d); grep -qxF \"\$line\" ~/.ssh/authorized_keys || printf '%s\n' \"\$line\" >> ~/.ssh/authorized_keys"
+  st=$?
+  if ((st == 0)); then
+    mkdir -p "$(dirname "$marker")" 2>/dev/null || true
+    printf '%s\n' "$line" >"$marker"
+    flog "push_mux_pubkey_remote: ok"
+    return 0
+  fi
+  flog "push_mux_pubkey_remote: fail st=$st"
+  return "$st"
+}
+
+# Prove BatchMode via agent (or legacy disk) without disturbing ControlMaster.
+mux_key_batch_ok() {
+  local sock
+  [[ -n "$FORGE_HOST" ]] || load_ssh_meta
+  ensure_mux_pubkey || return 1
+  if sock=$(mux_ssh_auth_sock); then
+    SSH_AUTH_SOCK="$sock" SSH_ASKPASS_REQUIRE=never ssh -F /dev/null \
+      -o ConnectTimeout=8 \
+      -o ConnectionAttempts=1 \
+      -o BatchMode=yes \
+      -o PreferredAuthentications=publickey \
+      -o IdentitiesOnly=yes \
+      -o IdentityAgent="$sock" \
+      -o IdentityFile="$MUX_PUB" \
+      -o HostName="$FORGE_HOST" \
+      -o User="$FORGE_USER" \
+      -o ControlMaster=no \
+      -o ControlPath=none \
+      "$FORGE_HOST" true >/dev/null 2>&1 && return 0
+  fi
+  if [[ -r "$MUX_KEY" ]]; then
+    SSH_ASKPASS_REQUIRE=never ssh -F /dev/null \
+      -o ConnectTimeout=8 \
+      -o ConnectionAttempts=1 \
+      -o BatchMode=yes \
+      -o PreferredAuthentications=publickey \
+      -o IdentitiesOnly=yes \
+      -o IdentityAgent=none \
+      -o IdentityFile="$MUX_KEY" \
+      -o HostName="$FORGE_HOST" \
+      -o User="$FORGE_USER" \
+      -o ControlMaster=no \
+      -o ControlPath=none \
+      "$FORGE_HOST" true >/dev/null 2>&1
+    return $?
+  fi
+  return 1
+}
+
+# After a YubiKey session: install pubkey once (agent must hold the key for verify).
+maybe_bootstrap_mux_key() {
+  local marker
+  marker="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/forge-mux-pubkey.ok"
+  ensure_mux_pubkey || return 0
+  if [[ -f "$marker" ]] && mux_key_batch_ok; then
+    return 0
+  fi
+  if ! ssh_master_alive 1; then
+    return 0
+  fi
+  # Need agent or legacy private to prove BatchMode after push.
+  if ! mux_agent_has_key && [[ ! -r "$MUX_KEY" ]]; then
+    flog "maybe_bootstrap_mux_key: skip — key not in agent (run --setup-mux-key)"
+    return 0
+  fi
+  push_mux_pubkey_remote || return 0
+  if mux_key_batch_ok; then
+    flog "maybe_bootstrap_mux_key: BatchMode verified"
+  else
+    flog "maybe_bootstrap_mux_key: pubkey pushed but BatchMode still fails"
+    rm -f "$marker" 2>/dev/null || true
+  fi
+}
+
+setup_mux_key() {
+  local remote_line sock="" load_bin
+  load_ssh_meta
+  printf '=== Forge mux key ↔ KeePass unlock trigger ===\n\n'
+  printf '(KeePassXC SSH Agent integration is OFF here: it triggers gpg/GCR and can kill KeePass.)\n\n'
+  systemctl --user enable --now ssh-agent.socket >/dev/null 2>&1 || true
+  sock=$(mux_ssh_auth_sock) || true
+  printf 'SSH agent socket: %s\n' "${sock:-MISSING — systemctl --user start ssh-agent.socket}"
+  generate_mux_keypair_staging
+  ensure_mux_pubkey || {
+    printf 'No mux pubkey. Abort.\n'
+    return 1
+  }
+  remote_line=$(mux_pubkey_line)
+  load_bin="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/bin/forge-mux-load-agent"
+  [[ -x $load_bin ]] || load_bin="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/forge-mux-load-agent"
+  if [[ -x $load_bin ]]; then
+    "$load_bin" || true
+  fi
+  printf '\nPubkey:\n  %s\n' "$MUX_PUB"
+  printf 'Private (stays on disk; loaded into agent on KeePass unlock):\n  %s\n' "$MUX_KEY"
+  printf '\nKeePassXC — do NOT use Entry → SSH Agent (crashes with GCR on this machine).\n'
+  printf 'Instead: Tools → Database settings → Triggers (or Tools → Triggers):\n'
+  printf '  Event: Unlocked database\n'
+  printf '  Action: Execute command line\n'
+  printf '  Command: %s\n' "$load_bin"
+  printf '\nAlso clear any SSH Agent checkboxes on entry forge-mux if you set them earlier.\n'
+  printf '\nPress Enter when ready to push pubkey to forge (YubiKey once)…\n'
+  read -r _ </dev/tty || true
+  if ! mux_agent_has_key && [[ -r "$MUX_KEY" ]] && sock=$(mux_ssh_auth_sock); then
+    SSH_ASKPASS_REQUIRE=never SSH_AUTH_SOCK="$sock" ssh-add "$MUX_KEY" </dev/null || true
+  fi
+  if ! mux_agent_has_key && [[ ! -r "$MUX_KEY" ]]; then
+    printf 'Agent empty and no private key. Abort.\n'
+    return 1
+  fi
+  printf '\nPublic key for %s:\n%s\n\n' "$REMOTE" "$remote_line"
+  if ssh_master_alive 1; then
+    printf 'Mux already up — installing pubkey on %s…\n' "$REMOTE"
+  else
+    printf 'Need a one-time YubiKey auth to install the pubkey on %s.\n' "$REMOTE"
+    ensure_forge || {
+      printf 'Could not open SSH. Add the line above to authorized_keys on forge, then re-run.\n'
+      return 1
+    }
+  fi
+  push_mux_pubkey_remote || {
+    printf 'Remote install failed. Add the pubkey manually.\n'
+    return 1
+  }
+  if ! mux_key_batch_ok; then
+    kill_mux
+    if ! open_master_batch || ! ssh_master_alive 1; then
+      printf 'Pubkey installed but BatchMode test failed.\n'
+      return 1
+    fi
+    rehome_mux || true
+  fi
+  printf '\nOK — agent holds forge-mux. Sleep/lock: silent reconnect.\n'
+  printf 'After reboot: unlock KeePass (trigger runs forge-mux-load-agent).\n'
+  return 0
+}
+
 ensure_forge() {
   local wait_st=0 st=0 why
   # YubiKey OTP enumerates as a USB keyboard and injects Ctrl+C. With
@@ -962,12 +1403,14 @@ ensure_forge() {
   # vanishes ~2s after plug — log showed wait exit=0 then silence.
   trap '' INT QUIT
   drop_stale_master
+  ensure_mux_pubkey || true
   # Retry liveness: a single Tailscale blip must not burn the YubiKey session.
   if ssh_master_alive 3; then
     flog "ensure_forge: existing mux alive"
     if ! rehome_mux; then
       warn_mux_rehome
     fi
+    maybe_bootstrap_mux_key || true
     trap - INT QUIT
     return 0
   fi
@@ -994,6 +1437,45 @@ ensure_forge() {
       wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
       continue
     fi
+    # Keep set +e: forge_tcp_ok / open_master return non-zero on purpose.
+    set +e
+    flog "ensure_forge: draw_status connexion"
+    draw_status "${REMOTE}  ·  connexion…"
+    flog "ensure_forge: wait_forge_tcp…"
+    wait_forge_tcp 30
+    st=$?
+    flog "ensure_forge tcp_ok st=$st why=${FORGE_TCP_WHY:-} host=$FORGE_HOST"
+    if ((st == 1)); then
+      draw_wait "${REMOTE}  ·  injoignable" "$UNREACH_BODY" 0
+      wait_st=$?
+      wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
+      continue
+    fi
+    if ((st != 0)); then
+      draw_wait "${REMOTE}  ·  refus SSH" "$(ssh_refuse_body "${FORGE_TCP_WHY:-refus}")" 0
+      wait_st=$?
+      wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
+      continue
+    fi
+    # KeePass → agent (or legacy disk key) before FIDO.
+    if [[ -r "$MUX_PUB" ]] || [[ -r "$MUX_KEY" ]]; then
+      flog "ensure_forge: try mux BatchMode (agent/legacy)"
+      if open_master_batch; then
+        flog "ensure_forge: mux ok"
+        if ! rehome_mux; then
+          warn_mux_rehome
+        fi
+        trap - INT QUIT
+        return 0
+      fi
+      flog "ensure_forge: mux failed — KeePass unlock or YubiKey"
+      if [[ -r "$MUX_PUB" ]] && ! mux_agent_has_key && [[ ! -r "$MUX_KEY" ]]; then
+        draw_wait "${REMOTE}  ·  KeePass / agent SSH" "$KEEPASS_BODY" 0
+        wait_st=$?
+        wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
+        continue
+      fi
+    fi
     if ! yubikey_present; then
       draw_wait "${REMOTE}  ·  YubiKey absente"
       wait_st=$?
@@ -1013,32 +1495,6 @@ ensure_forge() {
       flush_tty
       flog "ensure_forge: post-yubi drain done"
     fi
-    # Keep set +e: forge_tcp_ok / open_master return non-zero on purpose.
-    set +e
-    flog "ensure_forge: draw_status connexion"
-    draw_status "${REMOTE}  ·  connexion…"
-    flog "ensure_forge: forge_tcp_ok…"
-    forge_tcp_ok
-    st=$?
-    flog "ensure_forge tcp_ok st=$st why=${FORGE_TCP_WHY:-} host=$FORGE_HOST"
-    if ((st != 0)) && forge_try_lan_fallback; then
-      draw_status "${REMOTE}  ·  fallback LAN ${FORGE_HOST}…"
-      forge_tcp_ok
-      st=$?
-      flog "ensure_forge tcp_ok LAN st=$st why=${FORGE_TCP_WHY:-} host=$FORGE_HOST"
-    fi
-    if ((st == 1)); then
-      draw_wait "${REMOTE}  ·  injoignable" "$UNREACH_BODY" 0
-      wait_st=$?
-      wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
-      continue
-    fi
-    if ((st != 0)); then
-      draw_wait "${REMOTE}  ·  refus SSH" "$(ssh_refuse_body "${FORGE_TCP_WHY:-refus}")" 0
-      wait_st=$?
-      wait_should_quit "$wait_st" && { trap - INT QUIT; exit 0; }
-      continue
-    fi
     flog "ensure_forge: draw_pin"
     draw_pin
     flog "ensure_forge: open_master…"
@@ -1049,6 +1505,7 @@ ensure_forge() {
       if ! rehome_mux; then
         warn_mux_rehome
       fi
+      maybe_bootstrap_mux_key || true
       trap - INT QUIT
       return 0
     fi
@@ -1099,6 +1556,58 @@ stop_session() {
 if [[ "${1:-}" == --spaces-self-test ]]; then
   spaces_self_test
   exit 0
+fi
+
+if [[ "${1:-}" == --setup-mux-key ]]; then
+  setup_mux_key
+  exit $?
+fi
+
+if [[ "${1:-}" == --shred-mux-private ]]; then
+  if mux_agent_has_key; then
+    shred_mux_private
+    exit $?
+  fi
+  printf 'Refusing: forge-mux not in ssh-agent. Unlock KeePass / finish SSH Agent import first.\n'
+  exit 1
+fi
+
+# Silent after laptop resume: KeePass agent (or legacy disk) — no PIN / no Foot.
+if [[ "${1:-}" == --resume-mux ]]; then
+  trap 'flog "EXIT trap status=$? line=$LINENO resume-mux"; trap - INT QUIT EXIT' EXIT
+  set +e
+  load_ssh_meta
+  ensure_mux_pubkey || true
+  if ssh_master_alive 2; then
+    flog "resume-mux: already alive — nothing to do"
+    rehome_mux || true
+    exit 0
+  fi
+  drop_stale_master
+  if [[ ! -r "$MUX_PUB" ]] && [[ ! -r "$MUX_KEY" ]]; then
+    flog "resume-mux: no mux pubkey — run --setup-mux-key"
+    exit 1
+  fi
+  ensure_mux_in_agent || true
+  if ! mux_agent_has_key && [[ ! -r "$MUX_KEY" ]]; then
+    flog "resume-mux: key not in agent (unlock KeePassXC / forge-mux-load-agent)"
+    exit 1
+  fi
+  flog "resume-mux: BatchMode reconnect via agent/legacy"
+  ensure_tailscale || true
+  wait_forge_tcp 45
+  st=$?
+  if ((st != 0)); then
+    flog "resume-mux: tcp not ready st=$st why=${FORGE_TCP_WHY:-}"
+    exit 1
+  fi
+  if open_master_batch && { ssh_master_alive 1 || ssh_master_ok; }; then
+    rehome_mux || true
+    flog "resume-mux: restored ok (agent/legacy / no YubiKey)"
+    exit 0
+  fi
+  flog "resume-mux: BatchMode failed — unlock KeePass or open Forge CLI with YubiKey"
+  exit 1
 fi
 
 printf '\e]0;%s\a' "$WINDOW_TITLE" || true

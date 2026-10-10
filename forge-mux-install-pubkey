@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# One-shot: authorize forge-mux pubkey on forge via YubiKey.
+# Hardened against YubiKey OTP HID (Ctrl+C / Esc) killing Foot.
+set +e
+trap '' INT QUIT
+
+export SSH_AUTH_SOCK="${SSH_AUTH_SOCK:-${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ssh-agent.socket}"
+systemctl --user start ssh-agent.socket 2>/dev/null || true
+
+PUB="${CURSOR_REMOTE_MUX_KEY:-$HOME/.ssh/id_ed25519_forge_mux}.pub"
+# If MUX_KEY already ends without needing .pub doubling:
+case "${CURSOR_REMOTE_MUX_KEY:-}" in
+  *.pub) PUB="$CURSOR_REMOTE_MUX_KEY" ;;
+esac
+PRIV="${PUB%.pub}"
+[[ -r "$PUB" ]] || {
+  echo "Missing pubkey: $PUB"
+  echo "Entrée pour fermer."
+  read -r _ || true
+  exit 1
+}
+
+if [[ -r "$PRIV" ]]; then
+  SSH_ASKPASS_REQUIRE=never ssh-add "$PRIV" </dev/null 2>/dev/null || true
+fi
+
+LINE="from=\"100.64.0.0/10,192.168.0.0/16,10.0.0.0/8\" $(cat "$PUB")"
+HOST=$(ssh -G forge 2>/dev/null | awk 'tolower($1)=="hostname"{print $2; exit}')
+USER=$(ssh -G forge 2>/dev/null | awk 'tolower($1)=="user"{print $2; exit}')
+USER=${USER:-$LOGNAME}
+
+yubi_present() {
+  local f
+  for f in /sys/bus/usb/devices/*/idVendor; do
+    [[ -f "$f" ]] || continue
+    [[ "$(<$f)" == "1050" ]] && return 0
+  done
+  return 1
+}
+
+flush_tty() {
+  local drain
+  while IFS= read -r -t 0 -n 256 drain </dev/tty 2>/dev/null; do :; done
+}
+
+echo "=== Install forge-mux pubkey on forge ==="
+echo ""
+echo "$LINE"
+echo ""
+
+if ! yubi_present; then
+  echo "Branche la YubiKey…"
+  while ! yubi_present; do
+    sleep 0.5 || true
+  done
+fi
+echo "YubiKey détectée — drain OTP HID…"
+sleep 2 || true
+flush_tty
+sleep 0.5 || true
+flush_tty
+
+echo "Auth SSH (PIN + touch si demandé)…"
+# Prefer existing ControlMaster; else open with one sk key at a time.
+if ! ssh -O check forge >/dev/null 2>&1; then
+  ok=0
+  for ident in "$HOME/.ssh/id_ed25519_sk_yk1" "$HOME/.ssh/id_ed25519_sk_yk2"; do
+    [[ -r "$ident" ]] || continue
+    flush_tty
+    SSH_ASKPASS_REQUIRE=never ssh -F /dev/null \
+      -o ConnectTimeout=15 \
+      -o BatchMode=no \
+      -o PreferredAuthentications=publickey \
+      -o IdentitiesOnly=yes \
+      -o IdentityAgent=none \
+      -o IdentityFile="$ident" \
+      -o HostName="$HOST" \
+      -o User="$USER" \
+      -o ControlMaster=auto \
+      -o ControlPath="$HOME/.ssh/sockets/%C" \
+      -o ControlPersist=20h \
+      -o ServerAliveInterval=30 \
+      "$HOST" true </dev/tty >/dev/tty 2>/dev/tty
+    st=$?
+    if ((st == 0)) || ssh -O check forge >/dev/null 2>&1; then
+      ok=1
+      break
+    fi
+  done
+  if ((ok == 0)); then
+    echo "Échec auth YubiKey (status). Réessaie: relance ce script."
+    echo "Entrée pour fermer."
+    read -r _ </dev/tty || true
+    exit 1
+  fi
+fi
+
+echo "Push authorized_keys…"
+b64=$(printf '%s' "$LINE" | base64 -w0 2>/dev/null || printf '%s' "$LINE" | base64)
+ssh forge "umask 077; mkdir -p ~/.ssh; touch ~/.ssh/authorized_keys; chmod 600 ~/.ssh/authorized_keys; line=\$(printf '%s' '$b64' | base64 -d); grep -qxF \"\$line\" ~/.ssh/authorized_keys || printf '%s\n' \"\$line\" >> ~/.ssh/authorized_keys"
+st=$?
+if ((st != 0)); then
+  echo "Push failed (status $st)."
+  echo "Entrée pour fermer."
+  read -r _ </dev/tty || true
+  exit 1
+fi
+
+echo "Test BatchMode (agent + pubkey, sans YubiKey)…"
+ssh -O exit forge >/dev/null 2>&1 || true
+sleep 0.3 || true
+SSH_ASKPASS_REQUIRE=never ssh -F /dev/null \
+  -o ConnectTimeout=8 \
+  -o BatchMode=yes \
+  -o PreferredAuthentications=publickey \
+  -o IdentitiesOnly=yes \
+  -o IdentityAgent="$SSH_AUTH_SOCK" \
+  -o IdentityFile="$PUB" \
+  -o HostName="$HOST" \
+  -o User="$USER" \
+  -o ControlMaster=no \
+  -o ControlPath=none \
+  "$HOST" true
+st=$?
+if ((st == 0)); then
+  mkdir -p "${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
+  printf '%s\n' "$LINE" >"${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/forge-mux-pubkey.ok"
+  echo ""
+  echo "OK — forge accepte forge-mux sans YubiKey."
+else
+  echo "Pubkey poussée mais test BatchMode échoué (status $st)."
+  echo "Vérifie que forge-mux est dans l’agent: ssh-add -L | grep forge-mux"
+fi
+echo "Entrée pour fermer."
+read -r _ </dev/tty || true
+exit 0
