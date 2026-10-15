@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Report a Cursor persist session (SSH) to Omarchy Spaces.
+"""Report a Cursor persist or Claude Code tmux session (SSH) to Omarchy Spaces.
 
 Runs on the laptop. Cursor hooks on the remote write stamps; this process
 maps them onto the local Foot window PIDs and calls omarchy-shell.
@@ -30,6 +30,18 @@ HOOK_EVENTS = (
     "sessionEnd",
 )
 STAMP_NAME = "spaces-forge-stamp.py"
+CLAUDE_STAMP_NAME = "spaces-forge-stamp-claude.py"
+CLAUDE_HOOK_EVENTS = (
+    "UserPromptSubmit",
+    "PreToolUse",
+    "PostToolUse",
+    "Notification",
+    "SubagentStop",
+    "Stop",
+    "SessionEnd",
+)
+CLAUDE_RUNNING_RE = r"\besc to interrupt\b"
+CLAUDE_WAITING_RE = r"Do you want to [^\n?]{0,80}\?"
 APP_ID = "org.omarchy.agent.forge"
 STAMP_WORKING_GRACE = 20.0
 IDLE_POLLS = 8
@@ -123,6 +135,84 @@ print(json.dumps({
     "waiting": waiting,
 }, ensure_ascii=False))
 """
+
+# Claude Code in tmux -L <sock>. A client can move to another session when
+# its own one is destroyed, so resolve the session through the tmux client
+# whose command line carries the launcher's name, then read that session.
+CLAUDE_POLL_PY = r"""
+import json, os, re, subprocess, time
+from pathlib import Path
+
+name = os.environ.get("SESSION") or ""
+sock = os.environ.get("SOCK") or "claude-code"
+stamp_dir = Path.home() / ".local/state/spaces-forge/claude"
+now = time.time()
+
+def tmux(*args):
+    try:
+        return subprocess.check_output(
+            ["tmux", "-L", sock, *args], text=True, stderr=subprocess.DEVNULL
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return ""
+
+def cmdline(pid):
+    try:
+        return Path("/proc/%s/cmdline" % pid).read_bytes().replace(b"\0", b" ").decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+session = ""
+newest = (-1, "")
+pat = re.compile(r"(?:-s|-t) =?%s(?:\s|$)" % re.escape(name)) if name else None
+for line in tmux("list-clients", "-F", "#{client_pid}\t#{client_created}\t#{session_name}").splitlines():
+    parts = line.split("\t")
+    if len(parts) < 3:
+        continue
+    if pat and pat.search(cmdline(parts[0]) + " "):
+        session = parts[2].strip()
+        break
+    try:
+        created = int(parts[1])
+    except ValueError:
+        continue
+    if created >= newest[0]:
+        newest = (created, parts[2].strip())
+if not session:
+    session = name or newest[1]
+
+plain = ""
+title = ""
+if session:
+    plain = tmux("capture-pane", "-p", "-t", session + ":")
+    title = tmux("display-message", "-p", "-t", session + ":", "#{pane_title}").strip()
+tail = "\n".join(plain.rstrip().splitlines()[-30:])
+waiting = bool(re.search(WAITING_RE, tail))
+running = bool(re.search(RUNNING_RE, tail, re.I))
+
+stamp = ""
+stamp_age = 99999.0
+path = stamp_dir / session if session and "/" not in session else None
+if path and path.is_file():
+    parts = path.read_text(encoding="utf-8", errors="replace").split()
+    stamp = parts[0] if parts else ""
+    try:
+        stamp_age = now - int(parts[1])
+    except (IndexError, ValueError):
+        pass
+
+print(json.dumps({
+    "session": session,
+    "title": title,
+    "chat": session,
+    "stamp": stamp,
+    "stamp_age": round(stamp_age, 1),
+    "running": running,
+    "waiting": waiting,
+}, ensure_ascii=False))
+""".replace("WAITING_RE", repr(CLAUDE_WAITING_RE)).replace(
+    "RUNNING_RE", repr(CLAUDE_RUNNING_RE)
+)
 
 
 def log(path: Path, msg: str) -> None:
@@ -232,8 +322,14 @@ def report(session: str, state: str, pids: str, log_path: Path) -> None:
     )
 
 
-def ssh_py(remote: str, agent: str, session: str, script: str, timeout: float = 4.0) -> dict:
-    env = "SESSION=%s AGENT=%s python3 -u -" % (sh_quote(session), sh_quote(agent))
+def ssh_py(
+    remote: str, agent: str, session: str, script: str, timeout: float = 4.0, sock: str = ""
+) -> dict:
+    env = "SESSION=%s AGENT=%s SOCK=%s python3 -u -" % (
+        sh_quote(session),
+        sh_quote(agent),
+        sh_quote(sock),
+    )
     try:
         raw = subprocess.check_output(
             [
@@ -297,11 +393,62 @@ def decide(prev: str, seen: str, idle_n: int) -> tuple[str, int]:
     return "", idle_n
 
 
-def stamp_src_path() -> Path:
-    here = Path(__file__).resolve().parent / "hooks" / STAMP_NAME
+def stamp_src_path(name: str = STAMP_NAME) -> Path:
+    here = Path(__file__).resolve().parent / "hooks" / name
     if here.is_file():
         return here
-    return Path.home() / ".config/omarchy/cursor-cli-remote-hooks" / STAMP_NAME
+    return Path.home() / ".config/omarchy/cursor-cli-remote-hooks" / name
+
+
+def install_claude_hooks(remote: str, stamp_src: Path | None = None) -> bool:
+    stamp_src = stamp_src or stamp_src_path(CLAUDE_STAMP_NAME)
+    if not stamp_src.is_file():
+        return False
+    body = stamp_src.read_text(encoding="utf-8")
+    env = {**os.environ, "SSH_ASKPASS_REQUIRE": "never"}
+    dest = "~/.claude/hooks/%s" % CLAUDE_STAMP_NAME
+    upload = "mkdir -p ~/.claude/hooks && cat > %s && chmod +x %s" % (dest, dest)
+    merge = r"""
+import json
+from pathlib import Path
+cmd = "~/.claude/hooks/%s"
+path = Path.home() / ".claude" / "settings.json"
+data = {}
+if path.is_file():
+    loaded = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(loaded, dict):
+        data = loaded
+hooks = data.setdefault("hooks", {})
+for event in %s:
+    groups = hooks.setdefault(event, [])
+    if any(
+        isinstance(h, dict) and h.get("command") == cmd
+        for g in groups if isinstance(g, dict)
+        for h in g.get("hooks", [])
+    ):
+        continue
+    group = {"hooks": [{"type": "command", "command": cmd}]}
+    if event in ("PreToolUse", "PostToolUse", "Notification"):
+        group = {"matcher": "*", **group}
+    groups.append(group)
+path.parent.mkdir(parents=True, exist_ok=True)
+path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+""" % (CLAUDE_STAMP_NAME, json.dumps(list(CLAUDE_HOOK_EVENTS)))
+    for command, payload in ((upload, body), ("python3 -u -", merge)):
+        try:
+            subprocess.run(
+                ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8", remote, command],
+                input=payload,
+                text=True,
+                timeout=10,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=env,
+            )
+        except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            return False
+    return True
 
 
 def install_hooks(remote: str, stamp_src: Path | None = None) -> bool:
@@ -443,6 +590,25 @@ def self_test() -> int:
     if pids_csv(7, 10, 20) != "7,10,20":
         print("FAIL pids with ssh")
         failed += 1
+    claude_pane = [
+        ("✻ Pondering… (12s · ↓ 300 tokens · esc to interrupt)\n❯ ", True, False),
+        ("Bash command\n  rm -rf build\n Do you want to proceed?\n ❯ 1. Yes", False, True),
+        ("● Done.\n❯ \n  ⏵⏵ auto mode on (shift+tab to cycle)", False, False),
+    ]
+    for raw, want_run, want_wait in claude_pane:
+        running = bool(re.search(CLAUDE_RUNNING_RE, raw, re.I))
+        waiting = bool(re.search(CLAUDE_WAITING_RE, raw))
+        if (running, waiting) != (want_run, want_wait):
+            print("FAIL claude pane %r: got %r" % (raw, (running, waiting)))
+            failed += 1
+    for cmd, want in (
+        ("ssh -tt forge cd /w && exec env LANG=x tmux -u -L claude-code new-session -s cc-1 -c /w claude", "cc-1"),
+        ("ssh -tt forge exec env LANG=x tmux -u -L claude-code attach-session -t =cc-2", "cc-2"),
+        ("ssh -tt forge cd /w && exec agent persist attach abc", ""),
+    ):
+        if claude_attach_name(cmd) != want:
+            print("FAIL claude attach %r" % cmd)
+            failed += 1
     if failed:
         return 1
     print("spaces-forge-watch self-test ok")
@@ -488,13 +654,17 @@ def watch(args: argparse.Namespace) -> int:
     signal.signal(signal.SIGINT, handle_stop)
     signal.signal(signal.SIGHUP, handle_stop)
 
+    claude = args.backend == "claude"
+    poll_script = CLAUDE_POLL_PY if claude else POLL_PY
+    hook_install = install_claude_hooks if claude else install_hooks
+
     while not stopping["flag"]:
         if not proc_alive(launcher):
             log(log_path, "launcher gone")
             break
         now = time.time()
         if not hooks_ok and now >= hooks_next:
-            hooks_ok = install_hooks(args.remote)
+            hooks_ok = hook_install(args.remote)
             log(log_path, "hooks %s" % ("ok" if hooks_ok else "retry"))
             hooks_next = now + 60
         if ssh <= 1 or not proc_alive(ssh):
@@ -512,7 +682,7 @@ def watch(args: argparse.Namespace) -> int:
             continue
         pids = pids_csv(ssh, foot, launcher)
         last_good_pids = pids
-        data = ssh_py(args.remote, args.agent, name, POLL_PY)
+        data = ssh_py(args.remote, args.agent, name, poll_script, sock=args.sock)
         if not data:
             if last_key != "poll-fail":
                 log(log_path, "poll fail pids=%s" % pids)
@@ -575,7 +745,14 @@ def iter_pids() -> list[int]:
     return out
 
 
-def live_attaches() -> list[tuple[int, int, str]]:
+def claude_attach_name(cmdline: str) -> str:
+    if "-L claude-code" not in cmdline and "claude-code" not in cmdline:
+        return ""
+    m = re.search(r"(?:new-session -s|attach-session -t) =?(\S+)", cmdline)
+    return m.group(1) if m else ""
+
+
+def live_attaches() -> list[tuple[int, int, str, str]]:
     found = []
     for pid in iter_pids():
         if proc_text(pid, "comm").strip() != "ssh":
@@ -583,17 +760,22 @@ def live_attaches() -> list[tuple[int, int, str]]:
         cmdline = proc_cmdline(pid)
         if "RequestTTY=force" not in cmdline and "-tt" not in cmdline:
             continue
-        if "persist attach" not in cmdline:
+        backend = "cursor"
+        session = claude_attach_name(cmdline)
+        if session:
+            backend = "claude"
+        elif "persist attach" in cmdline:
+            m = re.search(r"persist attach (\S+)", cmdline)
+            session = m.group(1) if m else ""
+        else:
             continue
-        m = re.search(r"persist attach (\S+)", cmdline)
-        session = m.group(1) if m else ""
         launcher = proc_ppid(pid)
         if launcher <= 1:
             continue
         if "cursor-cli-remote" not in proc_cmdline(launcher):
             continue
         foot = foot_pid_of(launcher)
-        found.append((launcher, foot, session))
+        found.append((launcher, foot, session, backend))
     return found
 
 
@@ -624,7 +806,7 @@ def adopt(args: argparse.Namespace) -> int:
     log_path = Path(args.log)
     watch_bin = str(Path(__file__).resolve())
     started = 0
-    for launcher, foot, session in live_attaches():
+    for launcher, foot, session, backend in live_attaches():
         kill_watchers(launcher)
         time.sleep(0.2)
         runtime = Path(os.environ.get("XDG_RUNTIME_DIR") or "/tmp")
@@ -641,6 +823,10 @@ def adopt(args: argparse.Namespace) -> int:
             args.remote,
             "--agent",
             args.agent,
+            "--backend",
+            backend,
+            "--sock",
+            args.sock,
             "--state",
             state,
             "--log",
@@ -652,7 +838,7 @@ def adopt(args: argparse.Namespace) -> int:
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
-        log(log_path, "adopt launcher=%s foot=%s session=%s" % (launcher, foot, session))
+        log(log_path, "adopt launcher=%s foot=%s session=%s backend=%s" % (launcher, foot, session, backend))
         print("adopted launcher=%s foot=%s session=%s" % (launcher, foot, session))
         started += 1
     if not started:
@@ -671,6 +857,12 @@ def main() -> int:
     parser.add_argument("--remote", default=os.environ.get("CURSOR_REMOTE", "forge"))
     parser.add_argument("--agent", default=os.environ.get("CURSOR_REMOTE_AGENT", ""))
     parser.add_argument(
+        "--backend",
+        choices=("cursor", "claude"),
+        default=os.environ.get("CURSOR_REMOTE_BACKEND", "cursor"),
+    )
+    parser.add_argument("--sock", default=os.environ.get("CURSOR_REMOTE_CLAUDE_SOCK", "claude-code"))
+    parser.add_argument(
         "--log",
         default=str(
             Path(os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local/state"))
@@ -684,7 +876,7 @@ def main() -> int:
     if not args.agent:
         args.agent = str(Path.home() / ".local/bin/agent")
     if args.install_hooks:
-        ok = install_hooks(args.remote)
+        ok = (install_claude_hooks if args.backend == "claude" else install_hooks)(args.remote)
         print("hooks installed on %s" % args.remote if ok else "hooks install failed on %s" % args.remote)
         return 0 if ok else 1
     if args.adopt:

@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Super+Space launcher: pick / attach / stop Cursor `agent persist` sessions over SSH.
+# Super+Space launcher: pick / attach / stop persistent agent sessions over SSH.
+# Backend: claude (Claude Code in tmux -L claude-code) or cursor (`agent persist`).
 set -euo pipefail
 
 CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/cursor-cli-remote.env"
@@ -47,6 +48,10 @@ set +e
 REMOTE="${CURSOR_REMOTE:-forge}"
 REMOTE_DIR="${CURSOR_REMOTE_DIR:-$HOME/work}"
 AGENT="${CURSOR_REMOTE_AGENT:-$HOME/.local/bin/agent}"
+BACKEND="${CURSOR_REMOTE_BACKEND:-cursor}"
+CLAUDE="${CURSOR_REMOTE_CLAUDE:-$HOME/.local/bin/claude}"
+CLAUDE_ARGS="${CURSOR_REMOTE_CLAUDE_ARGS:---permission-mode auto}"
+CLAUDE_SOCK="${CURSOR_REMOTE_CLAUDE_SOCK:-claude-code}"
 WINDOW_TITLE="${CURSOR_REMOTE_TITLE:-Cursor Forge}"
 MAX_AGE_SECS="${CURSOR_REMOTE_MAX_AGE_SECS:-$((7 * 24 * 3600))}"
 # Backup if the 04:00 timer misses (suspend). Daily hard cutoff remains 04:00.
@@ -168,7 +173,7 @@ ssh_forge() {
 }
 
 # Spaces agent badge: laptop omarchy-shell + this window's PIDs.
-# Remote Cursor writes stamps; spaces-forge-watch maps them here.
+# Remote Cursor / Claude Code hooks write stamps; spaces-forge-watch maps them here.
 SPACES_ATTACH_ID=""
 SPACES_WATCH_PID=""
 SPACES_WATCH_STATE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/cursor-cli-remote-spaces.$$"
@@ -218,6 +223,8 @@ spaces_watch_start() {
     --session "$name" \
     --remote "$REMOTE" \
     --agent "$AGENT" \
+    --backend "$BACKEND" \
+    --sock "$CLAUDE_SOCK" \
     --state "$SPACES_WATCH_STATE" \
     --log "$SPACES_WATCH_LOG" &
   SPACES_WATCH_PID=$!
@@ -468,9 +475,75 @@ for name, ts in created.items():
     sys.stdout.write("%s\t%d\n" % (name, ts))
 '
 
+FETCH_CLAUDE_PY='
+import os, re, socket, subprocess, sys, time
+
+sock = os.environ["SOCK"]
+prune = os.environ.get("PRUNE") == "1"
+max_age = int(os.environ.get("MAX_AGE_SECS", str(7 * 24 * 3600)))
+host = socket.gethostname()
+
+def sessions():
+    try:
+        out = subprocess.check_output(
+            ["tmux", "-L", sock, "list-sessions", "-F",
+             "#{session_name}\t#{session_created}\t#{session_attached}\t#{pane_title}"],
+            text=True, stderr=subprocess.DEVNULL)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t", 3)
+        if len(parts) < 4:
+            continue
+        name, ts, att, title = parts
+        try:
+            ts = int(ts)
+        except ValueError:
+            ts = 0
+        rows.append((name, ts, att not in ("", "0"), title))
+    return rows
+
+def task(title):
+    # Claude Code sets the terminal title to the task, behind a spinner glyph.
+    t = re.sub(r"^[^\w(\[]+", "", title).strip()
+    if not t or t in (host, host.split(".")[0]) or t.lower() == "claude code":
+        return "Sans titre"
+    return t
+
+pruned = 0
+rows = sessions()
+if prune:
+    cutoff = int(time.time()) - max_age
+    for name, ts, _, _ in rows:
+        if 0 < ts < cutoff:
+            r = subprocess.run(["tmux", "-L", sock, "kill-session", "-t", "=" + name], capture_output=True)
+            if r.returncode == 0:
+                pruned += 1
+    rows = sessions()
+
+sys.stdout.write("---PRUNED---%d\n" % pruned)
+if not rows:
+    sys.stdout.write("No Cursor-managed persistent sessions\n")
+for name, ts, att, title in rows:
+    sys.stdout.write("Task: %s\n  Session: %s\n  Status: %s\n" % (task(title), name, "attached" if att else "detached"))
+sys.stdout.write("---CREATED---\n")
+for name, ts, _, _ in rows:
+    sys.stdout.write("%s\t%d\n" % (name, ts))
+'
+
 fetch_remote_cmd() {
   local prune="$1"
   local encoded
+  if [[ $BACKEND == claude ]]; then
+    encoded="$(printf '%s' "$FETCH_CLAUDE_PY" | base64 -w0)"
+    printf 'echo %s | base64 -d | SOCK=%s PRUNE=%s MAX_AGE_SECS=%s python3 -' \
+      "$(printf '%q' "$encoded")" \
+      "$(printf '%q' "$CLAUDE_SOCK")" \
+      "$(printf '%q' "$prune")" \
+      "$(printf '%q' "$MAX_AGE_SECS")"
+    return
+  fi
   encoded="$(printf '%s' "$FETCH_PY" | base64 -w0)"
   printf 'echo %s | base64 -d | AGENT=%s PRUNE=%s MAX_AGE_SECS=%s python3 -' \
     "$(printf '%q' "$encoded")" \
@@ -543,6 +616,7 @@ print(f"{key}  {stamp}  {dot}  {task}    {tag}\t{name}")
 header_sub() {
   local count="${1:-}" extra="${2:-}"
   local sub="${REMOTE}  ·  persist"
+  [[ $BACKEND == claude ]] && sub="${REMOTE}  ·  claude"
   if [[ "$count" == loading ]]; then
     sub+="  ·  connexion…"
   elif [[ -n "$count" ]]; then
@@ -1525,14 +1599,34 @@ ensure_forge() {
   trap - INT QUIT
 }
 
+# Claude sessions: one tmux server on a dedicated socket, status bar off so
+# it looks like a bare Claude Code. Closing Foot detaches; /exit ends it.
+# forge's ssh session has no LANG: without -u tmux draws every non-ASCII
+# glyph (Claude's logo, arrows) as '_'. LANG also reaches new sessions.
+claude_tmux() {
+  printf 'env LANG=en_US.UTF-8 tmux -u -L %q' "$CLAUDE_SOCK"
+}
+
 new_session() {
   SPACES_ATTACH_ID=""
+  if [[ $BACKEND == claude ]]; then
+    local name dir
+    name="cc-$(date +%m%d-%H%M%S)"
+    SPACES_ATTACH_ID="$name"
+    dir=$(printf '%q' "$REMOTE_DIR")
+    ssh_forge_tty "cd $dir && exec $(claude_tmux) new-session -s $name -c $dir $(printf '%q' "$CLAUDE") $CLAUDE_ARGS \\; set-option status off \\; set-option -s escape-time 0"
+    return
+  fi
   ssh_forge_tty "cd $(printf '%q' "$REMOTE_DIR") && exec $AGENT persist --trust"
 }
 
 attach_session() {
   local name="$1"
   SPACES_ATTACH_ID="$name"
+  if [[ $BACKEND == claude ]]; then
+    ssh_forge_tty "exec $(claude_tmux) attach-session -t $(printf '%q' "=$name")"
+    return
+  fi
   ssh_forge_tty "cd $(printf '%q' "$REMOTE_DIR") && exec $AGENT persist attach $(printf '%q' "$name")"
 }
 
@@ -1550,6 +1644,10 @@ run_session() {
 
 stop_session() {
   local name="$1"
+  if [[ $BACKEND == claude ]]; then
+    ssh_forge "$(claude_tmux) kill-session -t $(printf '%q' "=$name")"
+    return
+  fi
   ssh_forge "$AGENT persist stop $(printf '%q' "$name")"
 }
 
@@ -1649,6 +1747,7 @@ while true; do
       continue
     fi
     # Mux really works; remote command failed (agent missing / broken).
+    [[ $BACKEND == claude ]] && die "tmux / python3 injoignable sur ${REMOTE}."
     die "agent persist injoignable sur forge (${AGENT})."
   fi
 

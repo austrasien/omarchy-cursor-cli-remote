@@ -60,6 +60,7 @@ if [[ -f "$ROOT/forge-mux-install-pubkey" ]]; then
   install -m 0755 "$ROOT/forge-mux-install-pubkey" "$BIN_OMARCHY/forge-mux-install-pubkey"
 fi
 install -m 0755 "$ROOT/hooks/spaces-forge-stamp.py" "$HOOKS/spaces-forge-stamp.py"
+install -m 0755 "$ROOT/hooks/spaces-forge-stamp-claude.py" "$HOOKS/spaces-forge-stamp-claude.py"
 ln -sfn "$BIN_OMARCHY/cursor-cli-remote" "$BIN_OMARCHY/cursor-forge-persist"
 ln -sfn "$BIN_OMARCHY/cursor-cli-remote" "$BIN_LOCAL/cursor-cli-remote"
 ln -sfn "$BIN_OMARCHY/cursor-cli-remote" "$BIN_LOCAL/cursor-forge-persist"
