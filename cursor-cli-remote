@@ -1601,6 +1601,8 @@ ensure_forge() {
 
 # Claude sessions: one tmux server on a dedicated socket, status bar off so
 # it looks like a bare Claude Code. Closing Foot detaches; /exit ends it.
+# forge's tmux.conf sets detach-on-destroy off: without forcing it back on,
+# /exit would hop the client onto another live cc-* session.
 # forge's ssh session has no LANG: without -u tmux draws every non-ASCII
 # glyph (Claude's logo, arrows) as '_'. LANG also reaches new sessions.
 claude_tmux() {
@@ -1614,7 +1616,7 @@ new_session() {
     name="cc-$(date +%m%d-%H%M%S)"
     SPACES_ATTACH_ID="$name"
     dir=$(printf '%q' "$REMOTE_DIR")
-    ssh_forge_tty "cd $dir && exec $(claude_tmux) new-session -s $name -c $dir $(printf '%q' "$CLAUDE") $CLAUDE_ARGS \\; set-option status off \\; set-option -s escape-time 0"
+    ssh_forge_tty "cd $dir && exec $(claude_tmux) new-session -s $name -c $dir $(printf '%q' "$CLAUDE") $CLAUDE_ARGS \\; set-option status off \\; set-option -s escape-time 0 \\; set-option -g detach-on-destroy on"
     return
   fi
   ssh_forge_tty "cd $(printf '%q' "$REMOTE_DIR") && exec $AGENT persist --trust"
@@ -1624,7 +1626,7 @@ attach_session() {
   local name="$1"
   SPACES_ATTACH_ID="$name"
   if [[ $BACKEND == claude ]]; then
-    ssh_forge_tty "exec $(claude_tmux) attach-session -t $(printf '%q' "=$name")"
+    ssh_forge_tty "exec $(claude_tmux) attach-session -t $(printf '%q' "=$name") \\; set-option -g detach-on-destroy on"
     return
   fi
   ssh_forge_tty "cd $(printf '%q' "$REMOTE_DIR") && exec $AGENT persist attach $(printf '%q' "$name")"
