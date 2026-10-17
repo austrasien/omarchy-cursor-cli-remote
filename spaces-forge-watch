@@ -407,15 +407,20 @@ def install_claude_hooks(remote: str, stamp_src: Path | None = None) -> bool:
     body = stamp_src.read_text(encoding="utf-8")
     env = {**os.environ, "SSH_ASKPASS_REQUIRE": "never"}
     dest = "~/.claude/hooks/%s" % CLAUDE_STAMP_NAME
-    upload = "mkdir -p ~/.claude/hooks && cat > %s && chmod +x %s" % (dest, dest)
+    # Only touch files whose content changes: running sessions watch settings.json.
+    upload = (
+        "mkdir -p ~/.claude/hooks && t=$(mktemp ~/.claude/hooks/.stamp.XXXXXX) && cat > \"$t\""
+        " && if cmp -s \"$t\" %s; then rm -f \"$t\"; else chmod +x \"$t\" && mv \"$t\" %s; fi"
+    ) % (dest, dest)
     merge = r"""
 import json
 from pathlib import Path
 cmd = "~/.claude/hooks/%s"
 path = Path.home() / ".claude" / "settings.json"
 data = {}
-if path.is_file():
-    loaded = json.loads(path.read_text(encoding="utf-8"))
+old = path.read_text(encoding="utf-8") if path.is_file() else ""
+if old:
+    loaded = json.loads(old)
     if isinstance(loaded, dict):
         data = loaded
 hooks = data.setdefault("hooks", {})
@@ -431,8 +436,10 @@ for event in %s:
     if event in ("PreToolUse", "PostToolUse", "Notification"):
         group = {"matcher": "*", **group}
     groups.append(group)
-path.parent.mkdir(parents=True, exist_ok=True)
-path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+new = json.dumps(data, indent=2) + "\n"
+if new != old:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new, encoding="utf-8")
 """ % (CLAUDE_STAMP_NAME, json.dumps(list(CLAUDE_HOOK_EVENTS)))
     for command, payload in ((upload, body), ("python3 -u -", merge)):
         try:
@@ -847,7 +854,7 @@ def adopt(args: argparse.Namespace) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Spaces reporter for Cursor Forge CLI")
+    parser = argparse.ArgumentParser(description="Spaces reporter for Forge Code")
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--install-hooks", action="store_true")
     parser.add_argument("--adopt", action="store_true")

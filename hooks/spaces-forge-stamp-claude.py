@@ -13,21 +13,44 @@ from pathlib import Path
 
 STAMP_DIR = Path.home() / ".local/state/spaces-forge/claude"
 WORKING_EVENTS = {"UserPromptSubmit", "PreToolUse", "PostToolUse", "SubagentStop"}
+SOCK = os.environ.get("SPACES_FORGE_SOCK") or "claude-code"
 
 
-def tmux_session() -> str:
-    if not os.environ.get("TMUX"):
-        return ""
+def tmux_out(*args: str) -> str:
     try:
-        out = subprocess.check_output(
-            ["tmux", "display-message", "-p", "#{session_name}"],
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=2,
+        return subprocess.check_output(
+            ["tmux", *args], text=True, stderr=subprocess.DEVNULL, timeout=2
         )
     except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return ""
-    return out.strip()
+
+
+def ppid_of(pid: int) -> int:
+    try:
+        stat = Path("/proc/%d/stat" % pid).read_text()
+        return int(stat.rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return 0
+
+
+def tmux_session() -> str:
+    # Background agents (claude daemon / bg-pty-host) run outside tmux with no
+    # $TMUX, but still descend from the pane's claude: walk up to a pane pid.
+    panes = {}
+    for line in tmux_out("-L", SOCK, "list-panes", "-a", "-F", "#{pane_pid}\t#{session_name}").splitlines():
+        pid, _, name = line.partition("\t")
+        if pid.isdigit() and name:
+            panes[int(pid)] = name.strip()
+    pid = os.getpid()
+    for _ in range(32):
+        if pid <= 1:
+            break
+        if pid in panes:
+            return panes[pid]
+        pid = ppid_of(pid)
+    if os.environ.get("TMUX"):
+        return tmux_out("display-message", "-p", "#{session_name}").strip()
+    return ""
 
 
 def main() -> int:
